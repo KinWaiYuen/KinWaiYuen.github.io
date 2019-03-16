@@ -30,6 +30,8 @@ cow 写时复制
 //TODO 补充
 
 ## c++ ##
+### 不同类有同一个static
+//TODO 补充
 ### static a = fun() ###
 类A中有static a = func(); static b =1; 在什么时候能确定他们的值?
 在编译期,部署静态区的时候,a得到初始化1,b隐式初始化为0
