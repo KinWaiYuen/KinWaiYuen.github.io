@@ -6,7 +6,7 @@
 `using namespace std`直接可以使用各种的stl组件
 旧的组件**不**在namespace std中
 
-## gc和oo区别
+## gp和oop区别
 `oo`会在类中把函数和成员放一起,但是`gc`不会,数据结构和算法分开
 stl通过迭代器,泛化的指针,指向具体操作的内容
 `functor`仿函数,对两个类做操作,加减之类的
@@ -41,10 +41,13 @@ int main()
 容器的头和尾:
 begin指向第一个元素,end指向的是最后一个元素的下一个位置
 **end**指向的不是**最后一个**元素,可能是下一个需要分配的空间,但是**不是容器里的元素**
+```
 [s] [] [] [] [] [e]
 `begin`在s位置,但是`end`在[e]的下一个位置,也就是超过容器范围的位置.
+```
 直接使用`end`可能不能控制
 容器*不一定连续空间*
+
 
 ### 一般的遍历
 ```cpp
@@ -207,10 +210,10 @@ api
 标准库中的分配器 
 gnu下的分配器 都在ext/下 在命名空间`_gnu_cxx`下
 - mt_allocator mt multi thread 多线程
-- debug
-- pool 内存池
-- bitmap
-- malloc
+- debug_allocator
+- pool_allocator 内存池
+- bitmap_allocator
+- malloc_allocator
 
 直接使用分配器,分配多少内存要归还同样大小的内存.
 如果归还的和分配的不同,可能有问题 //TODO 查看可能问题
@@ -315,6 +318,7 @@ __pool_alloc使用的就是G2.9的alloc
 ## 容器分类
 
 复合关系,内嵌的有外层的
+```
 序列式容器:
 array
 -vector
@@ -337,6 +341,7 @@ hasptable
 -hash_map
 -hash_multiset
 -hash_multimap
+```
 
 ## list
 双向链表
@@ -517,7 +522,108 @@ cout << *ite;
 ...
 ```
 
-## forward_list
+## deque
+分段串起来
+![内存分布](../imgs/stl/deque.png)
+vector作为中控,指向不同的buffer.这个vector称为map
+前部扩充:vector前加一个buffer的指针,补充前部
+后补扩充:vector后加一个buffer指针,扩充后补
+增长:两倍增长(就是vector的增长方式)
+```cpp
+//一个缓冲区的默认大小.如果配置是0,默认值是 n!=0?n:(sz < 512?size_t(512/sz):size_t(1))
+//传入是0,如果T的大小>512,就只放1个;如果不是很大,放入512/size(T)个
+template <class T, class Alloc=alloc, size_t BUfsize = 0>
+class deque{
+    public:
+    typedef T value_type;
+    typedef __deque_iterator<T, T&, T*, BifSiz> iterator;
+    protected:
+    typedef pointer* map_pointer; //T** 是map_pointer的指针
+    protected:
+    //一共40个字节  iterator16*2+两个指针 
+    iterator start;
+    iterator finish;
+    map_pointer map;
+    size_type map_size;
+    public:
+    iterator begin(){return start;}
+    iterator end(){return end;}
+    size_type size() const {return finish - start;}
+};
+```
+
+iterator
+- cur 当前指针
+- first 当前指针所在buffer的第一个元素位置
+- last:当前指针所在buffer的end(前闭后开,是end的下一个)
+- node:指向`map`的vectop
+- ++/-- 每次都要判断是否到了边界.如果到了边界,node,first,last,cur都要判断看是否符合.借助`map`跳转到前一个/后一个buffer
+
+start迭代器
+指向当前begin cur first last node对应
+finish迭代器
+指向当前end(前闭后开,如果最后一个已经满了,cur是指向一个新的buffer的头)
+```cpp
+template <class T, class Ref, class Ptr, size_t BufSiz>
+struct __deque_iterator{
+    typedef random_access_iterator_tag iterator_category;
+    typedef T value_type;
+    typedef Ptr pointer;
+    typedef Ref reference;
+    typedef size_t size_type;
+    typedef ptrdiff_t difference_type;
+    typedef T** map_pointer; //因为最后map_pointer
+    typedef __deque_iterator self;
+
+    T* cur;
+    T* first;
+    T* last;
+    map_pointer node;
+}
+```
+一个deque的iterator大小是16(4个指针)
+
+insert 指定位置插入
+```cpp
+iterator insert(iterator position, const value_type &x){
+    if(position.cur==start.cur){//如果插入位置是最前端,且在最前端buffer的头:前端开辟,不用动原来数组
+        push_front(x);//放前面
+        return start;
+    }
+    else if(position.cur==finish.cur){//如果插入位置在后端buffer的最后面,直接放在最后面
+        push_back(x);
+        iterator tmp = finish;
+        --tmp;
+        return tmp;
+    }
+    else
+    {
+        return insert_aux(position,x);
+    }
+}
+template <class T, class Alloc, size_t BufSize>
+typename deque<T, Alloc, BufSize>::iterator
+deque<T, Alloc, BufSize>::insert_aux(iterator pos, const value_type& x){
+    difference_type index = pos - start;
+    value_type x_copy = x;
+    if(index < size() / 2){//如果在前半段,挪动前半段
+        push_front(front());
+        ...
+        copy(front1, pos1, front1);
+    }
+    else
+    {
+        push_back(back());//如果在后半段,挪动后半段
+        ...
+        copy_backward(pos, back2,back1);
+    }
+    *pos = x_copy;//新位置赋值
+    return pos;
+}
+```
+
+
+
 
 
 
