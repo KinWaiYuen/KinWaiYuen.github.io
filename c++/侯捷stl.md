@@ -314,28 +314,212 @@ __pool_alloc使用的就是G2.9的alloc
 
 ## 容器分类
 
+复合关系,内嵌的有外层的
 序列式容器:
 array
-vector
-    heap
-        priority+queue
-    list
-    slist
-    deque
-        stack
-        queue
+-vector
+--heap
+--priority+queue
+-list
+-slist
+-deque
+--stack
+--queue
 
 关联式容器:
 rb_tree
-    set
-    map
-    multiset
-    multimap
+-set
+-map
+-multiset
+-multimap
 hasptable
-    hash_set
-    hash_map
-    hash_multiset
-    hash_multimap
+-hash_set
+-hash_map
+-hash_multiset
+-hash_multimap
+
+## list
+双向链表
+
+list中list_node定义了指针,取大小的话应该是4
+```cpp
+template <class T>
+struct __list_node{
+    stpedef void *void_pointer;
+    void_pointer prev; //gnu2.9之前写void_pointer gnu4.9之后是*__list_node
+    void_pointer next;
+    T data;
+}
+```
+iterator:
+- iterator++ 通过next拿到下一个迭代器
+- iterator-- 通过prev拿到上一个迭代器
+
+iterator会有大量操作符存在,iterator要模拟指针,使用-> * ++ --的特性.
+几乎每个容器的iterator都会有自己的`ref` `T` `pointer`集中类型定义
+
+iterator
+++i prefix form 前置指针  self& operator++()
+实现:拿next指针赋值给this
+i++ postfix form 后置指针 self operator(int)
+实现:使用++i
+
+只能++++i 不能i++++
+为了模拟整数的自增符
+
+取值
+```cpp
+reference operator*() const{
+    return (*node).data;//直接拿到data的数据
+}
+pointer operator->() const{
+    return &(operator*());
+}
+```
+
+list的begin是第一个指针,end是最后的节点的下一个.end的next是begin
+是一个环状的链表
+
+### iterator遵循的原则
+iterator连接容器和算法,让算法可以处理容器的元素
+算法需要根据不同的数据类型进行处理,iterator需要满足算法确定的条件,就是iterator associated type.包括
+- iterator_category 移动性质.有的迭代器只能前进,有的能前进后退访问,有的可以+9 +3访问,这种属性 
+- value_type 元素的类型 T
+- pointer 没用
+- reference 没用
+- difference_type 元素之间的距离类型,ex:可以用unsinged int表示,或者其他类型
+  
+iterator traits用来分离class iterator和non-class iterator
+如果是类 返回
+```cpp
+template <class I>
+struct iterator_traits{
+    typedef typename I::value_type value_type
+};
+```
+如果收到的是指针,指针的类型就是value_type
+```cpp
+template <class T>
+struct iterator_traits<T*>{
+    typedef T value_type;
+}
+```
+用偏泛型来把类或者指针的迭代器属性返回,通过增加一层traits来封装这些类型的不同
+如果是指针类型,
+- iterator_category random_access_iterator_tag 可以随意访问的类型
+- difference_type ptrdiff_t
+- pointer T*
+- reference T&
+
+## vector
+扩充:新开辟内存后迁移过去
+capacity: 容量,当前可以容纳的元素个数
+size: 当前元素个数
+```cpp
+iterator start;//起始指针
+iterator finish;//最后一个的下一个,[)区间
+iterator end_of_storage;//最后的位置(并不是最后的那个,而是最后的下一个,尊徐前闭后开)
+size_type capacity(){
+    return size_type(end_of_storage()-begin());
+}
+size_type size(){
+    return size_type(finish() - begin());
+}
+```
+push_back函数
+```cpp
+void push_back(const T& x){
+    if(finish != end_of_storage)//如果finish还没到capacity的最后
+    {
+        construct(finish, x);//finish位置构造
+        ++finish;
+    }
+    else 
+    {
+        insert_aux(end(),x);//辅助插入 要构造新空间
+    }
+}
+void vector<T,Alloc>::insert_aux(iterator position, const T&x){
+    //作用:如果插入的时候需要整体挪动,但是空间足够:往后复制一个,挪动position到后面的,然后把位置放进去
+    //如果插入不够空间,申请空间后再挪动
+    if(finish != end_of_storage)//如果finish还没到capacity的最后 ~~因为可能会被其他的函数调用,所以再进行一次检查~~
+    {
+        //在后面新建一个最后的元素
+        construct(finish, *(finish - 1));//finish位置构造
+        ++finish;
+        T x_copy=x;
+        copy_backword(position, finish - 2, finish - 1);//把元素往后面挪
+        *position = x_copy;//把x_copy这个元素放进去position这里
+    }
+    else{
+        const size_tpye old_size = size();
+        const size_type len=old_size != 0 ? 2*old_size:1;
+        iterator new_start = data_allocator::allocate(len);//申请空间
+        iterator new_finish=new_start;//空白区域start=finish
+        try{
+            //把原来的vector拷贝到新的vector
+            new_finish = uninitial_copy(start, position, new_start);//start到position拷贝
+            construct(new_finish, x);//x放position
+            ++new_finish;//调整当前finish
+            new_finish=uninitialized_copy(position,finish,new_finish);
+        }
+        catch(){
+            ...
+        }
+        //释放旧的空间
+        destroy(begin(),end());
+        deallocate();
+        start = new_start;
+        finish=new_finish;
+        end_of_storage = new_start + len;//总占用空间,len是最初的位置
+    }
+}
+```
+vector的iterator声明 G2.9
+```cpp
+template <class T, class Alloc=alloc>
+class vector{
+    public:
+    typedef T value_type;
+    typedef value_type * iterator;//T* 本质是一个T类型的指针
+}
+vector<int> vec;
+
+vector<int>::iterator ite = vec.begin();
+```
+
+## array
+封装:为了遵循容器的规则
+```cpp
+template <typename _Tp, std::size_t _Nm>//需要制定大小,因为array指定空间大小不变
+struct array{
+    typedef _Tp value_type;
+    typedef _Tp* pointer;
+    typedef value_type* iterator;
+
+    value_type _M_instance[_Nm? _Nm:1];//不允许是0
+    iterator begin(){
+        return iterator(&_M_instance[0]);
+    }
+    iterator end(){
+        return iteraotr(&_M_instance[_Nm]);
+    }
+}
+//没有constructor 没有destroctor
+```
+
+使用
+```cpp
+array <int, 10> myArray;
+auto ite=myArray.begin();
+ite += 3;
+cout << *ite;
+...
+```
+
+## forward_list
+
+
 
 
 
