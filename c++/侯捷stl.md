@@ -1,0 +1,348 @@
+## 标准库&stl
+标准库>stl  但是70%-80%都是stl
+### 直接使用<库名>
+新式的`#include`直接是`#include <header>` 不需要 `#include <header.h>`
+### 新headers组件都放在std命名空间下
+`using namespace std`直接可以使用各种的stl组件
+旧的组件**不**在namespace std中
+
+## gc和oo区别
+`oo`会在类中把函数和成员放一起,但是`gc`不会,数据结构和算法分开
+stl通过迭代器,泛化的指针,指向具体操作的内容
+`functor`仿函数,对两个类做操作,加减之类的
+`adapter`适配器用于转换容器,仿函数,迭代器
+
+## 使用stl
+```cpp
+
+#include <iostream>
+#include <vector>
+#include <algorithm>
+#include <functional>
+
+using namespace std;
+int main()
+{
+    int ia[6] = {12,59354,23,5345,23,123};
+    //如果容器allocat的大小和内容不匹配可能有问题  
+    //TODO 测试上面
+    vector< int, allocator<int> > vi(ia,ia+6);
+
+    //计算符合条件的元素个数 开始把头和尾范围写入
+    //bind2nd 绑定第二个参数,function adapter
+    //less 比xx小   
+    //not >= function adapter
+    cout << count_if(vi.begin(), vi.end(), not1(bind2nd(less<int>(), 40)));
+    return 0;
+}
+```
+
+###stl遵循前闭后开区间
+容器的头和尾:
+begin指向第一个元素,end指向的是最后一个元素的下一个位置
+**end**指向的不是**最后一个**元素,可能是下一个需要分配的空间,但是**不是容器里的元素**
+[s] [] [] [] [] [e]
+`begin`在s位置,但是`end`在[e]的下一个位置,也就是超过容器范围的位置.
+直接使用`end`可能不能控制
+容器*不一定连续空间*
+
+### 一般的遍历
+```cpp
+Container<T> c;
+//每种容器都有自己的iterator
+Container<T>::iterator ite = c.begin();
+for(;ite!=c.end(); ++ite)
+{...}
+//ite是泛化的指针,++ *这些操作都支持
+```
+
+c++11以后 range-based for statement 
+```cpp
+for (decl:coll){}
+```
+ex:
+```cpp
+for(int i : {3,2,4,5,3,2,1,})
+{
+    std::cout << i << std::endl;
+}
+```
+```cpp
+std::vector<double> vec;
+//使用auto:elem是vec的元素类型(vec的iterator)
+//少用auto,应该更多指导使用的元素类型
+for (auto elem:vec)
+{
+    std::cout << elem << std::endl;
+}
+//引用,可以更改内容
+for (auto& elem : vec)
+{
+    elem *= 3;
+}
+```
+
+## 容器分类
+### 序列式容器 sequence container
+按照放进去的元素顺序存储(逻辑顺序)
+#### array 
+把数组包装成类,前后没办法扩充 开始定长,直接往对应位置赋值
+api
+- []第几个元素的访问/赋值
+- data 内存起始地址
+- front 第一个元素
+- back 最后一个元素
+
+#### vector 
+起点不动,后面如果长度增长,会扩充.单向扩充 
+使用`push_back`从后面放入. 
+如果vector放入的量较大,使用`try``catch`因为可能内存不够的时候可以缓解.因为两倍增长额时候需要重新申请内存空间进行分配.abort掉异常
+在另外的地方进行扩容,然后迁移
+常用api
+- size 大小
+- front 第一个元素
+- back 最后一个元素
+- data 内存其实地址
+- capacity 实际内存大小 最后会2^n的大小
+- push_back 放元素在后面.不能push_front
+
+#### list 
+链表,双向链表,双向环状链表
+api
+- max_size //TODO 确认max_size的算法
+- front 第一个元素
+- back 最后元素
+- sort 排序 标准库有sort,但是如果容器自己有sort,用容器的sort会快点 //TODO 为什么
+- push_back 放入list
+  
+#### forward-list(c++11)
+单向链表(大小会比list小,少一个前缀指针)
+- push_front 没有push_back函数,因为都是在前面进行插入,单向
+- sort 排序 //TODO sort后的指针怎样变化
+
+#### slist
+单向链表,是gnu c
+头文件在ext/slist
+
+#### deque 
+双向队列,两端可进可处,前后都可以扩充 
+结构:一个buffer有多个元素,多个buffer组成deque,逻辑连续.map中控各个buffer,分段连续.
+不断前后增加元素的时候,前/后buffer用完的时候会在前/后buffer继续扩充新的buffer
+可以用c的sort函数
+
+#### stack
+deque的变种,一端不变
+是container adapter 容器adapter.是deque的一种adapter
+不会有iterator 可能破坏数据顺序(给了ite就可能让操作者更改里面的元素,破坏filo)
+api
+- push放进去元素
+- top 顶
+- pop 取出
+
+#### queue
+deque的变种,一端进一端出
+是container adapter 容器adapter.是deque的一种adapter
+不会有iterator 可能破坏数据顺序(给了ite就可能让操作者更改里面的元素,破坏fifo)
+
+
+- push放进去元素
+- top 顶
+- pop 取出
+- size 
+- front
+
+ 
+
+
+### 关联式容器 associative container
+key value的 便于快速查找 为了查找方便 排序方便
+**适合写慢查快的**
+各家编译器的实现都用红黑树,因为查找快
+高度平衡二叉树,查找快
+- set 集合 元素不可以重复 使用红黑树.key就是value,value就是key 放入重复的会报错 //TODO 测试放入重复
+- multiset 元素可以重复 
+- map 红黑树 元素不可以重复 放入重复的会报错 //TODO 测试放入重复
+- multimap 元素可以重复   
+
+#### multiset
+api
+- insert 安插到应该的位置,具体位置不能由用户指定(红黑树制定了 已经排序)
+- size 当前大小
+- max_size
+- find 找里面的值 会比c自己的find要快 因为已经排序了
+
+#### multimap
+不可以用[]做插入
+api
+- insert c.insert(pair<long,string>(i,buf)) 插入的是pair 因为是kv对
+- size
+- find  ite.second value
+
+### unordered container 
+c++11出现的,就是一种关联式容器
+本质是hashtable 好查,但是顺序可能会因为后续更改而变.
+hashtable 使用separate chaining容错 目前最被采用的
+如果碰撞太多,可能会再把bucket打散,便于后续查找
+
+#### unordered_multiset
+如果元素个数>=桶数 会扩桶
+不能用[]插入
+
+api
+- insert 放入
+- bucket_count 桶个数
+- load_factor 
+#### unordered_multimap
+适合大量使用搜索的场景
+不能用[]插入
+
+#### set
+
+#### map
+能用`[]`插入,key就是`[]`的值
+#### unordered_map
+类似map 能`[]`插入
+
+## allocator
+标准库中的分配器 
+gnu下的分配器 都在ext/下 在命名空间`_gnu_cxx`下
+- mt_allocator mt multi thread 多线程
+- debug
+- pool 内存池
+- bitmap
+- malloc
+
+直接使用分配器,分配多少内存要归还同样大小的内存.
+如果归还的和分配的不同,可能有问题 //TODO 查看可能问题
+
+结论:直接使用容器可以避免对内存的管理,用完释放即可
+
+### oop gp
+oop data和method放一起
+gp分开
+- 方法负责上层的处理
+- 类需要处理好自己的特性能力,比如> <这些函数需要重载好,供方法使用
+  
+#### 随机访问迭代器
+random access iterator
+可以直接通过ite ++ -- / 直接访问iterator
+list的元素是用指针顺序放,不能随意拿到其中的元素指针
+因为sort需要使用的额是`随机访问迭代器`,但是list的iterator不满足,所以不能用sort直接对list排序
+因此不能随机访问的迭代器会有自己的sort函数
+
+
+### 模板编程
+- 类模板 `template <typename T> class X{T a();}`不指定类型,类的对应变量方式类型到了最后调用确定类型的时候再套入
+- 函数模板 `template <class T> const T& min(const T& a, T& b)`编译器对函数模板进行实参推导,最终选用了对应的类型/类的函数
+- 成员模板
+
+#### 类模板
+泛化 不指定类型
+```cpp
+template <class Key> struct hash{};
+```
+
+全特化 全特化就是限定死模板实现的具体类型
+```cpp
+template<> struct hash<char>{size_t operator()(char x) const {return x;}}; 
+```
+
+就是指定了char类型的时候hash的
+
+偏特化
+泛化
+```cpp
+template <class T, class Alloc = alloc>
+class vector{...};
+```
+
+偏特化 偏特化就是如果这个模板有多个类型，那么只限定其中的一部分。(可能针对不同类型性能等做额外调整)
+```cpp
+template <class Alloc>
+class vector<bool, Alloc>{...};
+```
+
+# allcoator
+分配器,尽量不要直接使用.
+容器直接使用
+
+##  new 和 malloc
+`operator new`会调用`malloc`
+new操作源码会调用malloc.但是malloc分配内存空间的时候会有额外的内存开销,用于存放malloc的其他所需的信息
+所以如果开辟的内存空间不大,此时额外的内存开销会占比大,不划算
+如果都是分配大量的string,占用内存不大,这种情况下比较吃亏
+![malloc内存分配](../imgs/stl/malloc.png)
+头尾有些当前分配的内存大小
+
+默认内存分配器是allocator
+
+vc中的allocator使用new,new使用malloc,delete使用free,没有特殊设计
+
+```cpp
+int *p = allocator<int>().allocate(512,(int*)0);
+allocator<int>().deallocate(p,512);
+```
+`allocator<int>()`就是一个临时对象,没有具体的名字.直接调用对应函数`allocate`
+函数allocate的声明
+```cpp
+allocate(size_type _N, const void *)
+```
+通过`const void *`来确定allocate需要扩展的是什么
+
+
+bc5的allocator也是使用new和delete分配内存
+
+gnu2.9标准库 使用new delete分配内存,在`allocator`中.**但是不会使用allocator分配内存**,真正使用**alloc**
+- 使用malloc对小内存的情况下开销大,对小空间申请内存的情况会
+- gnu会另外使用内存管理工具克服缺点
+
+alloc内存管理图
+![](../imgs/stl/alloc.png)
+诉求:减少malloc次数,减少额外开销
+做法:16条链表,每个链表负责对应对应大小的内存分配
+0:8b
+1:16b
+...
+15:128b
+小容器都调整到8的倍数大小后申请内存空间
+开始的时候就向操作系统申请一大块内存,切出来的内存另外用单向链表存起来.
+因此只有这个内存的信息,但是没有具体每个对象的内存信息,减少不必要开销.这就是alloc的好处
+
+gnu4.9版本
+使用allocator,实质是__allocator_base, 本质是new_allocator,直接用malloc,free
+__pool_alloc使用的就是G2.9的alloc
+
+## 容器分类
+
+序列式容器:
+array
+vector
+    heap
+        priority+queue
+    list
+    slist
+    deque
+        stack
+        queue
+
+关联式容器:
+rb_tree
+    set
+    map
+    multiset
+    multimap
+hasptable
+    hash_set
+    hash_map
+    hash_multiset
+    hash_multimap
+
+
+
+
+
+
+
+
+
+ 

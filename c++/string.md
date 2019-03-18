@@ -102,6 +102,8 @@ terminate called after throwing an instance of 'std::out_of_range'
   what():  basic_string::at
 [2]    19029 abort (core dumped)  ./resize
 ```
-非法访问导致core
+**非法访问导致core**
+
+
 
 
