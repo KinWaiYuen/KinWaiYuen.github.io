@@ -622,6 +622,138 @@ deque<T, Alloc, BufSize>::insert_aux(iterator pos, const value_type& x){
 }
 ```
 
+模拟连续区间
+```cpp
+reference front()
+{
+    return *start;
+}
+reference back()
+{
+    iterator tmp = finish;
+    --tmp;
+    return *tmp;
+}
+size_type size() const
+{
+    return finish - start;//此处会过载 - 运算符,算出finish和start中间有多少个区间*个数+头尾的长度
+}
+bool empty() const
+{
+    return finish == start;
+}
+reference operator*() const
+{
+    return *cur;//直接那cur的内容
+}
+pointer operator->()const
+{
+    return &(operator*());//使用*的引用
+}
+difference_type
+operator-(const self&x) const
+{
+    return difference_type(buffer_size()) * (node - x.node - 1)+(cur - first)+(x.last - x.cur);//buffer的大小*(当前的node-x的node -1)+(当前的cur-当前的first)+(x.last-x.cur) 
+    //就是中间buffer个数+当前到当前buff头距离+减去的位置到它尾部的距离
+}
+
+self &operator++(){//++i
+    ++cur;
+    if(cur == last){//因为last指的是最后一个buffer的下一个空间,所以可以先加
+        set_node(node + 1);
+        cur = first;
+    }
+    return *this
+}
+self operator++(int){//i++ 使用++实现
+    self tmp = *this;
+    ++*this;
+    return tmp;
+}
+self &operator--(){
+    if(cur == first){//如果已经在buffer头,到前一个buffer
+    //TODO 边界问题怎样避免?例如已经到了start的位置
+        set_node(node - 1);
+        cur = last;
+    }
+    -- cur;
+    return *this;
+}
+self operator--(int){
+    self tmp=*this;
+    --*this;
+    return *this;
+}
+void set_node(map_pointer new_node){
+    node = new_node;
+    first = *new_node;
+    last = first + difference_type(buffer_size());
+}
+self& operator+=(difference_type n){//迭代器可以当做指针使用的话,+n表示范文n个后面的那个元素
+    difference_type offset = n + (cur - first);//n直接加上当前cur与first的距离,超过buffer_size说明不在同一个buffer
+    if(offset >= 0 && offset < difference_type(buffer_size()))
+        cur += n;
+    else{//offert/buffer_size求出跳几多个buffer
+        difference_type node_offset = offset > 0? offset / difference_type(buffer_size())
+        : -difference_type(-offset - node_offset*difference_type(buffer_size()));
+        //支持小于0的difference_type操作,可以往前找
+        set_node(node + node_offset);
+        cur = first + (offset - node_offset * difference_type(buffer_size()));
+    }
+    return *this;
+}
+self operator+(difference_type n)const{
+    self tmp=*this;
+    return tmp += n;
+}
+self &operator -=(differenct_type n)
+{
+    return *this += -n;
+}
+self operator -(difference_type n)const
+{
+    self tmp = *this;
+    return tmp-=n;
+}
+reference operator[](differenct_type n) const
+{
+    return *(*this + n);
+}
+
+```
+`map`在扩容的时候会选择在vector的中段写入,方便前后扩容
+
+### queue
+一边入一边出的deque
+```cpp
+protected: Sequence c;
+public:
+bool empty()const { return c.empty();}
+size_type size() const {return c.size();}
+reference front() {return c.front();}
+const_reference front() const {return c.front();}
+reference back(){return c.back();}//队列尾巴:deque尾
+const_reference back() const{return c.back();}
+void push(const value_type &x){c.push_back(x);}//push就是deque的push_back 
+void pop(){c.pop_front();}//pop就是deque的pop_front
+//可以理解为deque改造:尾巴和头一样,尾巴进头出,没有了pop_back和push_front
+```
+### stack
+```cpp
+const_reference top() const{return c.back();}
+void push(const value_type&x) {c.push_back(x);}
+void pop(){c.pop_back();}
+//可以理解为deque改造:尾巴进尾巴出.没有了push_front和pop_front
+```
+
+stack或者queue不允许遍历,不提供iterator,会干扰fifo等特性.
+stack和queue可以选用list作为底层结构
+queue不能选vector做底层结构,stack可以.因为vector没有pop_front
+stack和queue都不可以用set或者map做底层结构 因为没有push_back back pop_back
+
+
+
+
 
 
 
