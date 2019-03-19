@@ -751,6 +751,77 @@ stack和queue可以选用list作为底层结构
 queue不能选vector做底层结构,stack可以.因为vector没有pop_front
 stack和queue都不可以用set或者map做底层结构 因为没有push_back back pop_back
 
+# 关联式容器
+查找快,插入算快
+底层是红黑树,散列表
+红黑树是平衡二叉树
+**不应该改红黑树里的元素**,但是rb_tree更改迭代器是可以的.
+map的key不能改,value可以改
+### 红黑树
+插入api
+- insert_unique() unique放入重复key不造成异常,照常返回,只是放入元素会少一个
+- insert_eqeal() 允许重复key 放在同key相邻的地方.多放几个会统计上
+ ```cpp
+ 类成员
+ size_type node_count;//树大小
+ link_type header;//红黑树头结点
+ Compare key_compare;//key比大小的规则,functor
+ ```
+ 红黑树header没有数据,header指向的是红黑树第一个节点
+ 红黑树的value组成:key+data
+
+### set & multiset
+ set key不能重复 使用红黑树的insert_unique
+ multiset key能重复 使用红黑树的insert_euqal
+ 底层红黑树
+ set的红黑树 value就是key
+ 提供遍历操作 ++ite遍历
+ 不能使用ite改变元素值
+
+### multi_map
+ multi_map 不能使用[]
+
+ ### map独有[],有小坑
+ map的[]符号,传入key,返回data.**但是如果没有对应的key,map里会用这个key新建一个节点使用默认data,并返回**
+ 符号[]使用lower_bound,查找当前符合的,如果有大量一样的key,会找排最前的.
+ 如果找不到key,返回适合安放key的位置
+
+###unordered系列
+底层哈希 
+哈希特性:如果桶个数不够元素个数多,会扩充两倍重新哈希
+
+ ## 迭代器分类
+ iterator_category:迭代器的分类
+ 各种tag是继承关系,不是枚举
+- random_access_iterator_tag:随机访问 array deque vector属于
+- bidirectional_iterator_tag:双向访问 list属于 map set红黑树的属于
+- forward_iterator_tag:单向访问 forward_list属于 hashtable属于
+- input_iterator_tag:istream
+- output_iterator_tag:ostream
+  
+### 迭代器不同对算法有影响
+计算元素之间距离的时候:
+- input_iterator_tag需要挨个next访问到目标位置,计算个数
+- random_access_iterator_tag直接end-start得到
+往一个方向步进
+- random_access_iterator_tag直接+n
+- input_iterator_tag按照一个方向++i
+- bidirectional_iterator_tag看方向++或者--i
+copy
+- char类型 memmove,效率高
+- T* 如果没琐碎操作(trivial_op) memmove 效率高 有:n < end-start
+- random_access_iterator_tag:挨个拷贝,但是 n< end - start 决定了循环次数 较快
+- 最慢:挨个拷贝,但是 for(;last!=first;) 每次都要对比
+trivial_op:如果没有析构函数构造函数,是使用系统默认的,就是has_no_trivial_op 否则就是has_trivial_op,因为有单独的复制拷贝
+
+有的算法是固定了iterator_category的,例如sort只能使用random_access_iterator_tag
+
+## reverse iterator
+![指向](../imgs/stl/reverse_iterator.png)
+  
+###仿函数
+是一个函数对象,一个对象但是类似函数的特质
+
 
 
 
