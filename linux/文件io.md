@@ -338,7 +338,7 @@ write(4, "sfesesf\nfsfesesf\nfsfesesf\nfsfese"..., 4096) = 4096
 ex:用户希望读入5个字节,但是内核从磁盘中读会读更多,减少磁盘的读.
 写反过来,写入的时候先写入内核的缓冲区,再批量写入磁盘
 
-```ditaa 
+```ditaa  {cmd=true args=["-E"]}
 用户程序     user                          kernel        磁盘
 +-----------+-----------------------+-----------+    +-----------+
 |           |                       |           |    |           |
@@ -764,5 +764,348 @@ int main(int argc, char * argv[])
 #### inode
 inode和fd类似,本质是一个结构体,存储文件属性信息:(ls -l查看的信息,例如权限,大小,用户,时间.... 以及**磁盘位置**)
 
+```ditaa {cmd=true args=["-E"]}
+┌───────────┐                                   
+│  dentry1  │                                   
+│┌─────────┐│     ┌──────────┐                  
+││filename1││     │  inode   │                  
+│├─────────┤│     │┌────────┐│                  
+││  inode  ├┼─┐   ││  time  ││                  
+│└─────────┘│ │   │├────────┤│   ┏━━━━━━━━━━━━━┓
+└───────────┘ │   ││  size  ││   ┃disk         ┃
+              │   │├────────┤│   ┃             ┃
+┌───────────┐ ├──▶││  user  ││   ┃┌────┐ ┌────┐┃
+│  dentry2  │ │   │├────────┤│   ┃│file│ │file│┃
+│┌─────────┐│ │   ││ group  ││   ┃└────┘ └────┘┃
+││filename2││ │   │├────────┤│   ┃┌────┐ ┌────┐┃
+│├─────────┤│ │   ││location├┼───▶│file│ │file│┃
+││  inode  ├┼─┤   │└────────┘│   ┃└────┘ └────┘┃
+│└─────────┘│ │   └──────────┘   ┗━━━━━━━━━━━━━┛
+└───────────┘ │                                 
+┌───────────┐ │                                 
+│  dentry3  │ │                                 
+│┌─────────┐│ │                                 
+││filename3││ │                                 
+│├─────────┤│ │                                 
+││  inode  ├┼─┘                                 
+│└─────────┘│                                   
+└───────────┘                                                                                       
+```
+dentry: directory entry
+硬链接就是建立了dentry,指向了相同的inode
+硬链接技术记录在inode里.当inode引用值为0,**磁盘空间不会被擦除.**.逻辑上感知不到磁盘,事实上数据还在.
 
+磁盘空间不会擦除,只会覆盖.
+因此格式化没有擦除数据,只是删了inode
+
+
+#### stat lstat
+int stat(const char *path, struct stat *buf);
+buf放文件属性,基本是inode的信息,有inode号码
+
+使用S_IRESG(buff.st_mode)能直接看文件属性
+- S_ISREG 普通文件
+- S_ISDIR 目录
+- S_ISCHR 字符设备
+- S_ISBLK 块文件
+- S_ISFIFO fifo
+- S_ISLNK  链接
+- S_ISSOCK socket
+
+```cpp
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/stat.h>
+
+int main(int argc, char *argv[])
+{
+    struct stat sb;
+    int ret = stat(argv[1],&sb);
+    if(ret == -1){
+        perror("stat err");
+        exit(1);
+    }
+    if(S_ISREG(sb.st_mode))
+    {
+        printf("reg file\n");
+    }else{
+        printf("not reg file\n");
+    }
+    return 0;
+}
+
+```
+对目录创建软连接之后,软连接stat是目录
+对文件创建软连接后,stat是reg
+```
+➜  linux ln -s fd fd.soft
+➜  linux ./mystat fd.soft
+reg file
+➜  linux lnln -s mydir mydir.soft
+➜  linux ./mystat mydir.soft
+dir
+```
+并没有打印是lnk,打印的是指向的文件.这个现象是stat穿透,可以穿透符号链接.
+
+使用lstat不会穿透符号链接
+```cpp
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/stat.h>
+
+int main(int argc, char *argv[])
+{
+    struct stat sb;
+    int ret = lstat(argv[1],&sb);
+    if(ret == -1){
+        perror("stat err");
+        exit(1);
+    }
+    if(S_ISREG(sb.st_mode))
+    {
+        printf("reg file\n");
+    }
+    else if(S_ISFIFO(sb.st_mode))
+    {
+        printf("fifo\n");
+    }
+    else if(S_ISDIR(sb.st_mode))
+    {
+        printf("dir\n");
+    }
+    else if(S_ISLNK(sb.st_mode))
+    {
+        printf("lnk\n");
+    }
+    
+    else{
+        printf("not reg file\n");
+    }
+    return 0;
+}
+```
+返回
+```
+➜  linux ././mystat mydir.soft
+lnk
+➜  linux ./mystat fd.soft
+lnk
+```
+
+cat**会**穿透符号链接,vim**不会**
+cat和vim链接,cat的是链接指向的文件,而vim打开的是链接本身
+ls -l不会穿透符号链接
+
+
+#### link unlink
+使用link建立硬链接,实际就是新建一个`dentry`指向一个`inode`
+
+建立硬链接 ln <source_file> <link_file>
+通过ll看
+```
+➜  src ll
+total 8.0K
+-rw-rw-r--. 2 parallels parallels 8 Mar 21 19:40 a.c
+-rw-rw-r--. 2 parallels parallels 8 Mar 21 19:40 a.hard
+```
+看到两个文件 第二个参数表示当前inode的连接数,是2
+
+mv实现: link + unlink 
+```cpp
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <fcntl.h>//O_RDONLY所在
+#include <errno.h>//errno所在
+
+int main(int argc, char* argv[])
+{
+    link(argv[1], argv[2]);
+    unlink(argv[1]);
+    return 0;
+}
+
+
+```
+
+linux删除文件机制是不断将t_nlink -1 直到0为止,无目录项文件系统择机释放(系统调度决定)
+
+unlink特征:清楚文件时如果文件硬连接数未0,没有dentry,文件不会马上被释放,要等到所有打开该文件的进程关闭该文件系统才找时间释放
+
+测试:
+```cpp
+#include <stdio.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+int main()
+{
+    int fd, ret;
+    char *p = "test of unlink\n";
+    char *p2 = "after write \n";
+    fd = open("temp.txt", O_RDWR|O_CREAT|O_TRUNC, 0644);
+    if(fd < 0){
+        perror("open temp err");
+        exit(1);
+
+    }
+    ret = write(fd, p, strlen(p));
+    if(ret == -1){
+        perror("----write err");
+    }
+    printf("print 1\n");
+    ret = write(fd, p2, strlen(p2));
+    if(ret == -1){
+        perror("----write err");
+    }
+
+    printf("print 2\n");
+    printf("press enter to continue\n");
+    getchar();
+    
+    //加上下面这行,程序会core掉
+    //p[3] = 'a';
+    ret = unlink("temp.txt");
+    if(ret == -1){
+        perror("unlink err");
+        exit(1);
+    }
+
+    return 0;
+}
+
+
+```
+能看到的是:
+1.执行到getchar的时候(被阻塞),进程中没有unlink,文件还在.但是执行了unlink之后,文件不存在.
+2.直接core了程序之后,还没有执行unlink,所以文件还在.
+
+如果先unlink:
+```cpp
+#include <stdio.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+int main()
+{
+    int fd, ret;
+    char *p = "test of unlink\n";
+    char *p2 = "after write \n";
+    fd = open("temp.txt", O_RDWR|O_CREAT|O_TRUNC, 0644);
+    if(fd < 0){
+        perror("open temp err");
+        exit(1);
+
+    }
+    ret = unlink("temp.txt");
+    if(ret == -1){
+        perror("unlink err");
+        exit(1);
+    }
+
+    ret = write(fd, p, strlen(p));
+    if(ret == -1){
+        perror("----write err");
+    }
+    printf("print 1\n");
+    ret = write(fd, p2, strlen(p2));
+    if(ret == -1){
+        perror("----write err");
+    }
+
+    printf("print 2\n");
+    printf("press enter to continue\n");
+    getchar();
+    
+    p[3] = 'a';
+
+    return 0;
+}
+
+```
+能看到:print是正常输出,在getchar时候,找不到文件.
+但是,print能正常输出,也就是unlink后fd还是能照常打开.
+**原因**:unlink只是让文件**具备释放的能力**,最后系统释放是到了系统发现没有进程打开文件才会真正删除
+最后文件写到哪里??
+ans:**struct_file**相关的缓存当中//TODO 确定struct_file在哪里 和inode相关的是什么?
+
+#### 隐式回收
+进程如果因为被core了,fd会被回收掉.隐式回收掉.
+操作系统在进程结束时,把进程打开的文件都会关闭掉,申请的内存空间释放掉.(不能依赖,这个是os特性)
+
+读符号链接: readlink 
+
+#### 文件/目录区别
+目录的内容:目录项
+|    |  r    | w   | x |
+|---|---|---|---|
+|文件|内容可以查看,可以cat more|内容可以修改 vi |可以运行产生一个进程 ./文件名|
+目录|可以被浏览 ls treev|创建,删除,修改文件   mv touch mkdir | 可以进入 打开  cd|
+
+目录同样的chmod做法
+ex:
+```
+➜  linux
+➜  linux chmod 111 mydir
+➜  linux cd mydir
+➜  mydir ls
+ls: cannot open directory .: Permission denied
+➜  mydir cd ..
+```
+只有执行权限  能进入  不能ls查看
+```
+ linux chmod 444 mydir
+➜  linux cd mydir
+cd: permission denied: mydir
+➜  linux lsls my
+ls: cannot access my: No such file or directory
+➜  linux ls mydir
+```
+只读之后,只能ls 不能进入
+
+#### dir相关
+```cpp
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <dirent.h>
+
+int main(int argc, char* argv[])
+{
+    DIR *dp;
+    struct dirent *sdp;
+
+    dp = opendir(argv[1]);
+    if(dp == NULL){
+        perror("opendir err");
+        exit(1);
+    }
+    while((sdp=readdir(dp)) != NULL)//列出目录下的名字
+    {
+        printf("%s\t", sdp->d_name);
+    }
+    printf("\n");
+    closedir(dp);
+        
+    return 0;
+}
+
+
+```
+dirent注意:
+- inode 记录inode号码
+- dname[256] 因此**文件名字不能超过255长度**
 
