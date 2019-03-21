@@ -1110,3 +1110,69 @@ dirent注意:
 - inode 记录inode号码
 - dname[256] 因此**文件名字不能超过255长度**
 
+### 递归 ls -R
+```cpp
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <dirent.h>
+
+#include <string.h>
+void isFilel(char* cName);
+void readDir(char* cDir)
+{
+    DIR *dp;
+    char cPath[256];
+    dp = opendir(cDir);
+    if(dp == NULL){
+        printf("opdir err|dir=%s\n", cDir);
+        perror("opendir err");
+        return;
+    }
+    struct dirent *sdp;
+    while((sdp = readdir(dp))!= NULL){
+        if(strcmp(sdp->d_name,".")==0 ||
+           strcmp(sdp->d_name,"..")==0)//如果是. 或者.. 应该跳过.否则./././或者 ../../..会导致死循环,重复调用isfile之后调用readdir
+        {
+            continue;
+        }
+
+        sprintf(cPath,"%s/%s",cDir,sdp->d_name);
+        isFilel(cPath);
+    }
+    closedir(dp);//要记得关闭dir,否则会因为占用过多fd导致出错(最多1021个)
+    return;
+}
+
+void isFilel(char* cName)
+{
+    int iRet = 0;
+    struct stat sBuf;
+    iRet= lstat(cName, &sBuf);
+    if(-1 ==iRet){
+        printf("stat err|dir=%s\n", cName);
+        perror("stat err");
+        return;
+    }
+    if(S_ISDIR(sBuf.st_mode)){
+        readDir(cName);
+    }
+    printf("%s\t%ld\n",cName,sBuf.st_size);
+    return;
+}
+int main(int argc, char *argv[])
+{
+    if(argc == 1)
+    {
+        isFilel(".");
+    }else{
+        isFilel(argv[1]);
+    }
+    return 0;
+}
+
+
+```
