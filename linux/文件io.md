@@ -1050,10 +1050,11 @@ ans:**struct_file**相关的缓存当中//TODO 确定struct_file在哪里 和ino
 
 #### 文件/目录区别
 目录的内容:目录项
+
 |    |  r    | w   | x |
 |---|---|---|---|
 |文件|内容可以查看,可以cat more|内容可以修改 vi |可以运行产生一个进程 ./文件名|
-目录|可以被浏览 ls treev|创建,删除,修改文件   mv touch mkdir | 可以进入 打开  cd|
+|目录|可以被浏览 ls treev|创建,删除,修改文件   mv touch mkdir | 可以进入 打开  cd|
 
 目录同样的chmod做法
 ex:
