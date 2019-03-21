@@ -400,7 +400,7 @@ read write称为unbuffered io,指的是没有用户级缓冲区(但是可能使�
                             |                                                                   |
                             +-------------------------------------------------------------------+
 ```
-![](../imgs/linux/文件io_fd.png)
+![](../imgs/linux/io_fd.png)
 内核在3g到4g位置
 内核区有pcb 进程控制块(process control block),控制进程,是一个结构体,其中包括文件描述符表,fd对应的是文件结构体`struct file`,能放在文件结构体的前提是成功open了文件.
 文件结构体会指向inode.//TODO 补充文件结构体相关
