@@ -1,4 +1,5 @@
 ipc,interprocess communication,进程间通信
+[TOC]
 
 ## ipc机制
 进程间通信本质是在内核中建立缓冲区(一般大小4096),让不同进程在内核空间进行写/读
