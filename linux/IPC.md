@@ -461,14 +461,1086 @@ int main(int argc, char* argv[])
 ex:a写入,b lseek到文件头然后读
 
 内存映射直接把磁盘文件映射到内存中,修改内存直接修改磁盘文件.
+```ditaa
+┌───────────────────┐             ┌───────────────────┐
+│      memory       │             │       disk        │
+│                   │             │                   │
+│                   │             │                   │
+│                   │             │                   │
+├───────────────────◀──map────────┼───────────────────┤
+│███████████████████│             │███████████████████│
+│███████████████████│             │███████████████████│
+│███████████████████│             │███████████████████│
+│███████████████████│             │███████████████████│
+│███████████████████│             │███████████████████│
+│███████████████████│             │███████████████████│
+├──────────────────◀┼─────map─────┼───────────────────┤
+│                   │             │                   │
+│                   │             │                   │
+│                   │             │                   │
+│                   │             │                   │
+│                   │             │                   │
+│                   │             │                   │
+└───────────────────┘             └───────────────────┘
+```
 
 创建共享内存映射
-#include <sys/mman.h>
+include: <sys/mman.h>
 void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset);
-- addr 指定映射区首地址 通常传NULL,让系统自动分配
+
+- addr 指定映射区首地址 通常传NULL,让系统自动分配 但是可以malloc出来一个区域然后指定//TODO 实验
 - length 共享内存映射区大小
-- prot protection 表示映射内存的保护属性 属性位&组合
+- prot protection 表示映射内存的保护属性 属性位|组合.告诉内核内存的访问级别
 > - PROT_EXEC 页可能执行
 > - PROT_READ 页可能读
 > - PROT_WRITE 页可能写
 > - PROT_NONE 页不能访问
+- flags 标注共享内存的共享属性
+> - MAP_SHARED 对内存修改反映到磁盘上
+> - MAP_PRIVATE **对内存的修改不会反映到磁盘上**
+- fd 共享内存打开的文件fd
+- offset 偏移位置,需要是4k的整数倍 默认0 全部映射
+
+返回值
+- 成功: 映射区的首地址
+- 失败: MAP_FAILED (void *) -1. errno
+
+释放内存映射
+int munmap(void *addr, size_t length);
+- addr map返回值
+- length 映射内存长度
+
+返回
+- 成功 0
+- 失败  -1 errno
+
+```cpp
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <pthread.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+
+void sys_err(const char* str){
+    perror(str);
+    exit(1);
+}
+
+int main(int argc, char* argv[])
+{
+    void *p = NULL;
+    int fd = open(argv[1],O_RDWR|O_CREAT|O_TRUNC, 0644);
+    if(fd == -1){
+        sys_err("open err");
+    }
+    ftruncate(fd, 20);
+    int len = lseek(fd, 0, SEEK_END);
+    p = mmap(NULL, len, PROT_READ| PROT_WRITE, MAP_SHARED, fd, 0);
+    if(p == MAP_FAILED){
+        sys_err("map fail");
+    }
+
+    strcpy(p, "hello map");
+    //strcpy(p, "hello map how is it of bigger than 20 , try it");
+
+
+    int ret = munmap(p, len);
+    if(ret == -1){
+        sys_err("munmap err");
+    }
+
+    return 0;
+}
+```
+打开写入文件
+```
+hello map^@^@^@^@^@^@^@^@^@^@^@
+```
+后面写入文件空洞
+
+如果写入长度超过20(指定的长度)
+```cpp
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <pthread.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+
+void sys_err(const char* str){
+    perror(str);
+    exit(1);
+}
+
+int main(int argc, char* argv[])
+{
+    void *p = NULL;
+    int fd = open(argv[1],O_RDWR|O_CREAT|O_TRUNC, 0644);
+    if(fd == -1){
+        sys_err("open err");
+    }
+    ftruncate(fd, 20);
+    int len = lseek(fd, 0, SEEK_END);
+    p = mmap(NULL, 30, PROT_READ| PROT_WRITE, MAP_SHARED, fd, 0);
+    if(p == MAP_FAILED){
+        sys_err("map fail");
+    }
+
+
+    strcpy(p, "test how is it if longer than 20 what the fxxxxxxxxxxk");
+
+    int ret = munmap(p, len);
+    if(ret == -1){
+        sys_err("munmap err");
+    }
+
+    return 0;
+}
+不管内存长度比文件大还是一样,后续都是被截断
+```
+test how is it if lo
+```
+
+文件能写入但是截断.
+```ditaa
+     ┌──────────────────────────────────────────────────┐
+     │                      memory                      │
+     ├────────────────────────────┬──can write,but──────┘
+   map                          map  ─not map in ────▶   
+     ▼────────────────────────────▼      disk            
+     │            disk            │                      
+     └────────────────────────────┘                      
+```
+
+如果超过页长度 应该触发SIGSEV //TODO test 
+
+问题:
+####  open的时候直接O_CREAT而不ftruncate一个新文件做创建映射?
+```cpp
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <pthread.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+
+void sys_err(const char* str){
+    perror(str);
+    exit(1);
+}
+
+int main(int argc, char* argv[])
+{
+    void *p = NULL;
+    int fd = open(argv[1],O_RDWR|O_CREAT|O_TRUNC, 0644);
+
+    if(fd == -1){
+        sys_err("open err");
+    }
+    int len = 20;
+    /* ftruncate(fd, 20); */
+    /* int len = lseek(fd, 0, SEEK_END); */
+    p = mmap(NULL, 30, PROT_READ| PROT_WRITE, MAP_SHARED, fd, 0);
+    if(p == MAP_FAILED){
+        sys_err("map fail");
+    }
+
+
+    strcpy(p, "test how is it if longer than 20 what the fxxxxxxxxxxk");
+
+    int ret = munmap(p, len);
+    if(ret == -1){
+        sys_err("munmap err");
+    }
+
+    return 0;
+}
+```
+不使用truncate,文件大小是0,默认新建.
+指定新文件的时候:
+```
+➜  mmap ./mmap tt
+[1]    22708 bus error (core dumped)  ./mmap tt
+```
+core了.
+bus error,总线错误.
+gdb看下core在哪里
+```
+
+Program received signal SIGSEGV, Segmentation fault.
+0x00000000004006fe in main (argc=2, argv=0x7fffffffe1e8) at mmap.c:30
+30          strcpy(p, "test how is it if longer than 20 what the fxxxxxxxxxxk");
+Missing separate debuginfos, use: debuginfo-install glibc-2.17-260.el7_6.3.x86_64
+(gdb)
+```
+在写入内存的时候core了//TODO 为什么是总线错误
+
+**注意**
+创建**映射区域文件的大小为0,实际非0大小创建映射区域**,出现总线错误.**这里是在写入内存才出错,mmap没出错**.
+但是创建映射区域文件的大小不为0,程序不会core.
+如果创建映射区大小为0,返回mmap的入参不合法
+
+#### open fd read only,实际mmap要写入
+
+
+```cpp
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <pthread.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+
+void sys_err(const char* str){
+    perror(str);
+    exit(1);
+}
+
+int main(int argc, char* argv[])
+{
+    void *p = NULL;
+    int fd = open(argv[1],O_RDONLY);
+
+    if(fd == -1){
+        sys_err("open err");
+    }
+    int len = 30;
+    p = mmap(NULL, len, PROT_READ| PROT_WRITE, MAP_SHARED, fd, 0);
+    if(p == MAP_FAILED){
+        sys_err("map fail");
+    }
+
+
+    strcpy(p, "test how is it if longer than 20 what the fxxxxxxxxxxk");
+
+    int ret = munmap(p, len);
+    if(ret == -1){
+        sys_err("munmap err");
+    }
+
+    return 0;
+}
+
+```
+
+```
+mmap ./mmap ttt
+map fail: Permission denied
+```
+结论:fd只写,但是mmap要写入的时候,权限出错.这里是**在mmap的时候就出错了**.
+
+#### mmap只读,往内存中写.
+
+```cpp
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <pthread.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+
+void sys_err(const char* str){
+    perror(str);
+    exit(1);
+}
+
+int main(int argc, char* argv[])
+{
+    void *p = NULL;
+    int fd = open(argv[1],O_RDONLY);
+
+    if(fd == -1){
+        sys_err("open err");
+    }
+    int len = 30;
+    p = mmap(NULL, len, PROT_READ, MAP_SHARED, fd, 0);
+    if(p == MAP_FAILED){
+        sys_err("map fail");
+    }
+
+
+    strcpy(p, "test how is it if longer than 20 what the fxxxxxxxxxxk");
+
+    int ret = munmap(p, len);
+    if(ret == -1){
+        sys_err("munmap err");
+    }
+
+    return 0;
+}
+
+```
+
+```
+./mmap ttt
+[1]    28862 segmentation fault (core dumped)  ./mmap ttt
+```
+gdb看下core的地方
+```(gdb) r ttt
+Starting program: /media/psf/centos/src/linux/mmap/mmap ttt
+
+Program received signal SIGSEGV, Segmentation fault.
+0x00000000004006f9 in main (argc=2, argv=0x7fffffffe1e8) at mmap.c:30
+30          strcpy(p, "test how is it if longer than 20 what the fxxxxxxxxxxk");
+(gdb)
+```
+看到是写入的时候core,就是写入保护的内存core
+
+
+注意:这个时候是可以创建mmap的,只是到了写入的时候才发生错误.也就是内核不会为fd属性做检查.
+
+#### open只写,mmap只读
+
+```cpp
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <pthread.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+
+void sys_err(const char* str){
+    perror(str);
+    exit(1);
+}
+
+int main(int argc, char* argv[])
+{
+    void *p = NULL;
+    int fd = open(argv[1],O_WRONLY| O_CREAT | O_TRUNC, 0664);
+
+    if(fd == -1){
+        sys_err("open err");
+    }
+    int len = 30;
+    p = mmap(NULL, len, PROT_WRITE, MAP_SHARED, fd, 0);
+    if(p == MAP_FAILED){
+        sys_err("map fail");
+    }
+
+
+    strcpy(p, "test how is it if longer than 20 what the fxxxxxxxxxxk");
+
+    int ret = munmap(p, len);
+    if(ret == -1){
+        sys_err("munmap err");
+    }
+
+    return 0;
+}
+
+```
+结果
+```
+➜  mmap ./mmap tt
+map fail: Permission denied
+```
+没有权限访问
+因为文件fd是按照只写的方式打开,但是内存映射只读.
+
+**结论**类似文件权限和open权限用于,mmap的时候对fd的权限也有限制
+
+#### fd只写,mmap只写
+```cpp
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <pthread.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+
+void sys_err(const char* str){
+    perror(str);
+    exit(1);
+}
+
+int main(int argc, char* argv[])
+{
+    void *p = NULL;
+    int fd = open(argv[1],O_WRONLY| O_CREAT | O_TRUNC, 0664);
+
+    if(fd == -1){
+        sys_err("open err");
+    }
+    int len = 30;
+    p = mmap(NULL, len, PROT_WRITE , MAP_SHARED, fd, 0);
+    if(p == MAP_FAILED){
+        sys_err("map fail");
+    }
+
+
+    strcpy(p, "test how is it if longer than 20 what the fxxxxxxxxxxk");
+
+    int ret = munmap(p, len);
+    if(ret == -1){
+        sys_err("munmap err");
+    }
+
+    return 0;
+}
+```
+
+```
+➜  mmap ./mmap t2
+map fail: Permission denied
+```
+没有权限.
+因此mmap必须要有文件的读权限才可以操作
+
+**结论** mmap需要文件的读权限
+
+
+总结:mmap权限要有文件fd的读权限,且mmap权限<=文件权限
+
+#### fd先关闭对mmap是否影响
+不影响
+```cpp
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <pthread.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+
+void sys_err(const char* str){
+    perror(str);
+    exit(1);
+}
+
+int main(int argc, char* argv[])
+{
+    void *p = NULL;
+    int fd = open(argv[1],O_RDWR| O_CREAT | O_TRUNC, 0664);
+
+    if(fd == -1){
+        sys_err("open err");
+    }
+    int ret = 0;
+    ret = ftruncate(fd, 20);
+    if(ret == -1){
+        printf("truncate err");
+    }
+    int len = 30;
+    p = mmap(NULL, len, PROT_WRITE , MAP_SHARED, fd, 0);
+    if(p == MAP_FAILED){
+        sys_err("map fail");
+    }
+    close(fd);
+
+
+    strcpy(p, "test how is it if");
+
+    ret = munmap(p, len);
+    if(ret == -1){
+        sys_err("munmap err");
+    }
+
+    return 0;
+}
+```
+文件还能写入
+```
+test how is it if^@^@^@
+```
+
+**结论** fd关闭后还能让mmap操作
+
+#### mmap最后参数是1000会怎样
+返回
+```
+➜  mmap ./mmap t
+map fail: Invalid argument
+```
+必须是4096的整数倍才行 -> 是**MMU***决定的
+
+#### mmap最后参数diff如果超过文件大小会怎样
+ex
+```cpp
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <pthread.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+
+void sys_err(const char* str){
+    perror(str);
+    exit(1);
+}
+
+int main(int argc, char* argv[])
+{
+    void *p = NULL;
+    int fd = open(argv[1],O_RDWR| O_CREAT | O_TRUNC, 0664);
+
+    if(fd == -1){
+        sys_err("open err");
+    }
+    int ret = 0;
+    ret = ftruncate(fd,4095);
+    if(ret == -1){
+        printf("truncate err");
+    }
+    int len = 30;
+    p = mmap(NULL, len, PROT_WRITE , MAP_SHARED, fd, 4096);
+    if(p == MAP_FAILED){
+        sys_err("map fail");
+    }
+    close(fd);
+
+
+    strcpy(p, "test how is it if");
+
+    ret = munmap(p, len);
+    if(ret == -1){
+        sys_err("munmap err");
+    }
+
+    return 0;
+}
+```
+
+```
+➜  mmap ./mmap tt
+[1]    29909 bus error (core dumped)  ./mmap tt
+```
+看下core的位置
+```
+Reading symbols from /media/psf/centos/src/linux/mmap/mmap...done.
+(gdb) r t2
+Starting program: /media/psf/centos/src/linux/mmap/mmap t2
+
+Program received signal SIGBUS, Bus error.
+0x0000000000400816 in main (argc=2, argv=0x7fffffffe258) at mmap.c:36
+36	    strcpy(p, "test how is it if");
+Missing separate debuginfos, use: debuginfo-install glibc-2.17-260.el7_6.3.x86_64
+(gdb)
+```
+可以看到是在写入内存的时候core的.
+
+如果超过了内存映射也最后一页写,会SIGSEV
+```ditaa
+     ┌──────────────────────────────────────────────────┬───────────────────┐
+     │                 memory end page                  │ memory next page  │
+     ├────────────────────────────┬─────────────────────┴───────────────────┘
+   map                            │  can write,but      │   cant write from here       
+     ▼────────────────────────────▼  ─not map in ────▶  │  ─get SIGSEV─────▶ 
+     │            disk            │      disk           │      core          
+     └────────────────────────────┘                                          
+```
+
+引发问题:**如果内存偏移在文件末端,但是写的长度超过了页?**
+要写满一页才能测试.没写满的前提下超过文件末端无效
+
+```cpp
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <pthread.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+
+void sys_err(const char* str){
+    perror(str);
+    exit(1);
+}
+
+int main(int argc, char* argv[])
+{
+    void *p = NULL;
+    int fd = open(argv[1],O_RDWR| O_CREAT | O_TRUNC, 0664);
+
+    if(fd == -1){
+        sys_err("open err");
+    }
+    int ret = 0;
+    ret = ftruncate(fd,5000);
+    if(ret == -1){
+        printf("truncate err");
+    }
+    int len = 30;
+    p = mmap(NULL, len, PROT_WRITE , MAP_SHARED, fd,4096);
+    if(p == MAP_FAILED){
+        sys_err("map fail");
+    }
+    close(fd);
+
+    char ptest[6000]={0};
+    int i = 0;
+    for(i = 0; i < 6000;i++){
+        ptest[i] = '1';
+    }
+    sprintf(p,ptest,6000);
+    /* strcpy(p, "test how is it if"); */
+
+    ret = munmap(p, len);
+    if(ret == -1){
+        sys_err("munmap err");
+    }
+
+    return 0;
+}
+```
+执行:
+```
+➜  mmap ./mmap we
+[1]    3949 segmentation fault (core dumped)  ./mmap we
+```
+
+**结论**:会core.和上面结论一页,超过了文件长度roundup之后的也,写的时候回core SIGSEV
+
+
+#### mmap的地址++之后能不能被munmap?
+```cpp
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <pthread.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+
+void sys_err(const char* str){
+    perror(str);
+    exit(1);
+}
+
+int main(int argc, char* argv[])
+{
+    void *p = NULL;
+    int fd = open(argv[1],O_RDWR| O_CREAT | O_TRUNC, 0664);
+
+    if(fd == -1){
+        sys_err("open err");
+    }
+    int ret = 0;
+    ret = ftruncate(fd,80);
+    if(ret == -1){
+        printf("truncate err");
+    }
+    int len = 30;
+    p = mmap(NULL, len, PROT_WRITE , MAP_SHARED, fd,0);
+    if(p == MAP_FAILED){
+        sys_err("map fail");
+    }
+    close(fd);
+
+    strcpy(p++, "test how is it if");
+
+    ret = munmap(p, len);
+    if(ret == -1){
+        sys_err("munmap err");
+    }
+
+    return 0;
+}
+```
+
+返回非法
+```
+➜  mmap ./mmap t3
+munmap err: Invalid argument
+```
+munmap申请的地址必须是mmap申请到的地址,否则返回入参非法
+
+#### MAP_PRIVATE
+```cpp
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <pthread.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+
+void sys_err(const char* str){
+    perror(str);
+    exit(1);
+}
+
+int main(int argc, char* argv[])
+{
+    void *p = NULL;
+    int fd = open(argv[1],O_RDWR| O_CREAT | O_TRUNC, 0664);
+
+    if(fd == -1){
+        sys_err("open err");
+    }
+    int ret = 0;
+    ret = ftruncate(fd,80);
+    if(ret == -1){
+        printf("truncate err");
+    }
+    int len = 30;
+    p = mmap(NULL, len, PROT_WRITE ,MAP_PRIVATE, fd,0);
+    if(p == MAP_FAILED){
+        sys_err("map fail");
+    }
+    close(fd);
+
+    strcpy(p, "test how is it if");
+
+    ret = munmap(p, len);
+    if(ret == -1){
+        sys_err("munmap err");
+    }
+
+    return 0;
+}
+```
+结果:文件没有写入
+
+#### 总结
+- mmap隐含文件
+- map_shared要求mmap权限<=文件权限
+- mmap释放与fd关闭无关,只要映射建立,fd可以关闭
+- fd的文件大小为0,不能mmap,会core.如果mmap出现总线错误一般是fd的文件大小.ex:文件30,mmap偏移4096
+- munmap传入mmap的地址,**不能对mmap地址++**
+- offset偏移必须4K整数倍
+- mmap创建很可能出错,必须检查返回
+
+保险用法
+fd = open("filename",O_RDWR);
+mmap(NULL,<文件大小>,PROT_READ|PROT_WRITE, MAP_SHARED,fd,0);
+
+### 父子进程间通信
+需要建立通信,要用MAP_SHARED这个flag
+- MAP_PRIVATE 父子进程各自独占映射区
+- MAP_SHARED 共享
+ 
+```cpp
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <pthread.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+
+void sys_err(const char* str){
+    perror(str);
+    exit(1);
+}
+
+int var = 100;
+int main(int argc, char* argv[])
+{
+    int *p = NULL;
+    int fd = open(argv[1],O_RDWR| O_CREAT | O_TRUNC, 0664);
+
+    if(fd == -1){
+        sys_err("open err");
+    }
+
+    int ret = 0;
+    ret = ftruncate(fd,80);
+    if(ret == -1){
+        printf("truncate err");
+    }
+    int len = 30;
+    //p = (int *) mmap(NULL, len, PROT_WRITE ,MAP_PRIVATE, fd,0);//读取的时候父进程读到0 因为各自一份内存
+    p = (int *) mmap(NULL, len, PROT_WRITE ,MAP_SHARED, fd,0);
+    if(p == MAP_FAILED){
+        sys_err("map fail");
+    }
+    close(fd);
+
+    pid_t pid = fork();
+    if(pid == 0){
+        *p = 2000;
+        var = 1000;
+        printf("child : *p=%d var=%d\n",*p, var);
+        ret = munmap(p, len); if(ret == -1){
+            sys_err("munmap err");
+        }
+    }
+    else{
+        sleep(1);
+        printf("father: *p=%d var=%d\n",*p, var);
+        ret = munmap(p, len); if(ret == -1){
+            sys_err("munmap err");
+        }
+    }
+
+
+
+    return 0;
+}
+```
+
+#### 非血缘进程间通信
+```cpp
+//读
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <pthread.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+
+struct student{
+    int id;
+    char name[256];
+    int age;
+};
+
+void sys_err(const char* str){
+    perror(str);
+    exit(1);
+}
+
+int main(int argc, char* argv[])
+{
+    struct student stu = {1, "heiheihei", 18};
+    struct student *p;
+    int fd = open(argv[1],O_RDONLY);
+    if(fd == -1){
+        sys_err("open err");
+    }
+    ftruncate(fd, sizeof(stu));
+    p = (struct student *)mmap(NULL, sizeof(stu), PROT_READ, MAP_SHARED, fd,0);
+    close(fd);
+    if(p == MAP_FAILED)
+    {
+        sys_err("mmap err");
+    }
+
+    while(1){
+
+        printf("id=%d name=%s age=%d\n", p->id, p->name,p->age);
+        sleep(1);
+    }
+
+    int ret = munmap(p, sizeof(stu));
+    if(ret == -1)
+    {
+        perror("unmap fail");
+    }
+
+    return 0;
+}
+
+//写
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <pthread.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+
+struct student{
+    int id;
+    char name[256];
+    int age;
+};
+
+void sys_err(const char* str){
+    perror(str);
+    exit(1);
+}
+
+int main(int argc, char* argv[])
+{
+    struct student stu = {1, "heiheihei", 18};
+    struct student *p;
+    int fd = open(argv[1],O_RDWR|O_CREAT|O_TRUNC,0664);
+    if(fd == -1){
+        sys_err("open err");
+    }
+    ftruncate(fd, sizeof(stu));
+    p = (struct student *)mmap(NULL, sizeof(stu), PROT_WRITE, MAP_SHARED, fd,0);
+    close(fd);
+    if(p == MAP_FAILED)
+    {
+        sys_err("mmap err");
+    }
+
+    while(1){
+        memcpy(p, &stu, sizeof(stu));
+        stu.id +=1;
+        sleep(1);
+    }
+
+    int ret = munmap(p, sizeof(stu));
+    if(ret == -1)
+    {
+        perror("unmap fail");
+    }
+
+    return 0;
+}
+```
+可以多个写多个读同时进行,本质就是直接在一个内存空间操作.
+
+**总结**
+两个进程,打开同一个文件创建映射区
+flags是MAP_SHARED
+一个写入一个写出
+
+### 匿名映射
+不用每次都新建或者打开文件,直接拿到共享的内存空间 
+flags |= MAP_ANON 不需要产生文件的前提下建立共享内存,没有名字.
+
+小测试:如果文件创建后,建立mmap之后unlink了,文件还会不会存在?
+```cpp
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <pthread.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+
+void sys_err(const char* str){
+    perror(str);
+    exit(1);
+}
+
+int var = 100;
+int main(int argc, char* argv[])
+{
+    int *p = NULL;
+    int fd = open(argv[1],O_RDWR| O_CREAT | O_TRUNC, 0664);
+
+    if(fd == -1){
+        sys_err("open err");
+    }
+
+    int ret = 0;
+    ret = ftruncate(fd,80);
+    if(ret == -1){
+        printf("truncate err");
+    }
+    int len = 30;
+    p = (int *) mmap(NULL, len, PROT_WRITE ,MAP_SHARED, fd,0);
+    if(p == MAP_FAILED){
+        sys_err("map fail");
+    }
+    close(fd);
+    ret = unlink(argv[1]);
+    if(ret == -1){
+        printf("unlink err");
+    }
+
+    pid_t pid = fork();
+    if(pid == 0){
+        *p = 2000;
+        var = 1000;
+        printf("child : *p=%d var=%d\n",*p, var);
+        ret = munmap(p, len); if(ret == -1){
+            sys_err("munmap err");
+        }
+    }
+    else{
+        sleep(10);
+        printf("father: *p=%d var=%d\n",*p, var);
+        ret = munmap(p, len); if(ret == -1){
+            sys_err("munmap err");
+        }
+    }
+
+
+
+    return 0;
+}
+```
+答案:不会
+
+
+使用MAP_ANON,flags中|=MAP_ANON,并且fd设置为-1. 需要新一点的linux版本才支持.老的unix不支持.
+
+```cpp
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <pthread.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+
+void sys_err(const char* str){
+    perror(str);
+    exit(1);
+}
+
+int var = 100;
+int main(int argc, char* argv[])
+{
+    int *p = NULL;
+    int len = 80;
+    p = (int *) mmap(NULL, len, PROT_WRITE ,MAP_SHARED | MAP_ANON, -1,0);
+    if(p == MAP_FAILED){
+        sys_err("map fail");
+    }
+    int ret = 0;
+
+    pid_t pid = fork();
+    if(pid == 0){
+        *p = 2000;
+        var = 1000;
+        printf("child : *p=%d var=%d\n",*p, var);
+        ret = munmap(p, len); if(ret == -1){
+            sys_err("munmap err");
+        }
+    }
+    else{
+        sleep(10);
+        printf("father: *p=%d var=%d\n",*p, var);
+        ret = munmap(p, len); if(ret == -1){
+            sys_err("munmap err");
+        }
+    }
+
+
+
+    return 0;
+}
+```
+返回
+```
+➜  mmap ./map_anon
+child : *p=2000 var=1000
+father: *p=2000 var=100
+```
+
+
+不支持匿名映射的机器,可以使用文件
+`/dev/zero`,从这个文件中拿数据可以随便拿,但是都是文件空洞.
+`dev/null`是文件黑洞,写什么这个文件都是null
+
+如果机器不支持匿名映射,可以
+int fd = open("/dev/zero",O_RDWR) 就不需要删除文件等操作
+因为fork之后共享了mmap映射区,所以**只有有血缘关系的才能使用匿名映射
+

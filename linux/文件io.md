@@ -796,6 +796,7 @@ int main(int argc, char * argv[])
 
 ```
 一样填充文件空洞
+**注意** truncate需要**fd是有写标记**的时候才能生效
 
 
 
