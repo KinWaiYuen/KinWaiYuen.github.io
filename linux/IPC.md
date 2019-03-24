@@ -2106,14 +2106,812 @@ time <二进制>能看到二进制执行过程的时间占用
 实际执行时间=系统时间+用户时间+等待时间(更多是等待设备.会等待内存,cpu等)
 结论:程序运行瓶颈在IO.优化程序**首选优化IO**
 
+测试:5个并发子进程,杀其中一个
+```cpp
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <pthread.h>
+#include <signal.h>
+
+void sys_err(const char* str){
+    perror(str);
+    exit(1);
+}
+
+int main(int argc, char* argv[])
+{
+    int i = 0;
+    pid_t pid;
+    pid_t pF = getpid();
+    for(i = 0;i < 5; i++)
+    {
+        pid = fork();
+        if(pid < 0)
+        {
+            sys_err("fork err");
+        }
+        else if(pid == 0)break;
+    }
+
+    if(pid == 0){
+        while(1){
+            sleep(1);
+            printf("i am %dth child, pid=%d\n",i, getpid());
+        }
+    }
+    else{
+        sleep(3);
+        kill(pid, SIGKILL);
+        printf("father kill pid %d\n",pid);
+    }
+    return 0;
+}
+```
 
 
 
 
 
 
-### settimer (软件条件产生信号)
+### setitimer (软件条件产生信号)
+alarm使用自然计时法,输入自然时间(时间间隔)
+setitimer可以控制计时方法.
+<sys/time.h>
+int getitimer(int which, struct itimerval *curr_value)
+int setitimer(int which, const struct itimerval *new_val, struct itimerval *old_val);
+which参数:
+- ITIMER_REAL 自然时间法 计算**自然时间** 发的是SIGALRM
+- ITIMER_VIRTUAL 虚拟时间计时法,用户空间计时,程序运行在用户空间的时候计时,**只计算进程占用cpu时间** 发的是SIGBTALRM
+- ITIMER_PROF 用户+内核 计算**占用cpu以及执行系统调用的时间**  发的是SIGPROF
+new_val:时间设置.
+new_val和old_val中结构体itimerval的两个参数:
+- it_interval:sheding两次定时任务之间的时间间隔
+- it_value:定时的时长
+基于timerval的特性,可以实现**周期定时**
+关于参数it_value和it_interval:
+```ditaa
+                  after      
+  alarm       ┌──alarmed,───┐
+after set     │   cycle     │
+─────────────▶│             ▼
+┌─────────────┬─────────────┐
+│  it_value   │ it_iterval  │
+└─────────────┴─────────────┘
+              ▲             │
+              │      after  │
+              └─────alarmed,┘
+                     cycle   
+```
+
+
+
+返回
+- ok: 0
+- gg: -1 errno 
+- old_val 旧的时间设置,就是上次的剩余时间.(相当于alarm的返回,但是alarm精确到秒)
+
+测试
+```cpp
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <pthread.h>
+#include <sys/time.h>
+#include <sys/signal.h>
+
+void sys_err(const char* str){
+    perror(str);
+    exit(1);
+}
+
+void myfunc(int signo){
+    printf("get alarm.signo=%d\n",signo);
+}
+
+int main(int argc, char* argv[])
+{
+    struct itimerval it, oldit;
+    signal(SIGALRM, myfunc);
+
+    //两秒之后开始出发alarm
+    it.it_value.tv_sec = 2;
+    it.it_value.tv_usec = 0;
+
+    //没5s出发一次
+    it.it_interval.tv_sec = 5;
+    it.it_interval.tv_usec = 0;
+
+    if(setitimer(ITIMER_REAL, &it, &oldit) == -1){
+        sys_err("set timer err");
+    }
+    while(1);
+
+    return 0;
+}
+```
+
+
 
 ### 其他信号函数
 abort
 raise
+
+### 信号集操作
+```ditaa
+                                            pending
+                                            ┌─────┐                ┌─────┐            ┌─────┐                      
+                                            │  0  │                │  0  │            │  0  │                      
+                                            ├─────┤                ├─────┤            ├─────┤                      
+                             ┌─────────────▶│  0  │                │  0  │            │  0  │                      
+                             │              ├─────┤                ├─────┤            ├─────┤                      
+                             │              │  0  │                │  0  │            │  0  │                      
+                             │              ├─────┤      2.proc    ├─────┤4.after     ├─────┤                      
+                             │              │  0  │────────not ───▶│  1  │──done─────▶│  0  │                      
+                             │              ├─────┤      dealed    ├─────┤            ├─────┤                      
+                             │              │  0  │                │  0  │            │  0  │                      
+                             │              ├─────┤                ├─────┤            ├─────┤                      
+                             │              │  0  │                │  0  │            │  0  │                      
+                             │              ├─────┤                ├─────┤            ├─────┤                      
+                             │              │  0  │                │  0  │            │  0  │                      
+                             │              ├─────┤                ├─────┤            ├─────┤                      
+┌───────────────────────┐    │              │  0  │                │  0  │            │  0  │                      
+│                       │    │              ├─────┤                ├─────┤            ├─────┤                      
+│        ┌────┐         │    │              │  0  │                │  0  │            │  0  │                      
+│        │    │         │    │              ├─────┤                ├─────┤            ├─────┤                      
+│        ├────┤         │    │              │ ... │                │ ... │            │ ... │                      
+│        ├────┤─────────┼────┘              ├─────┤                ├─────┤            ├─────┤                      
+│        ├────┤         │                   │  0  │                │  0  │            │  0  │                      
+│        ├────┤─────────┼────┐              ├─────┤                ├─────┤            ├─────┤                      
+│        │    │         │    │              │  0  │                │  0  │            │  0  │                      
+│        └────┘         │    │              └─────┘                └─────┘            └─────┘                      
+├───────────────────────┤    │                                                                                     
+│                       │    │               mask_set              user_set             mask_set                        
+│                       │    │              ┌─────┐               ┌─────┐                ┌─────┐            ┌─────┐
+│                       │    │              │  0  │               │  0  │                │  0  │            │  0  │
+│                       │    │              ├─────┤               ├─────┤                ├─────┤            ├─────┤
+│                       │    └─────────────▶│  0  │               │  0  │                │  0  │            │  0  │
+│                       │                   ├─────┤               ├─────┤                ├─────┤            ├─────┤
+│                       │                   │  0  │               │  0  │                │  0  │            │  0  │
+│                       │                   ├─────┤               ├─────┤1.1 mask set    ├─────┤ 3.proc     ├─────┤
+│                       │                   │  0  │─1.0 |= set───▶│  1  │───changed─────▶│  1  │unblock────▶│  0  │
+│                       │                   ├─────┤               ├─────┤                ├─────┤            ├─────┤
+│                       │                   │  0  │               │  0  │                │  0  │            │  0  │
+│                       │                   ├─────┤               ├─────┤                ├─────┤            ├─────┤
+│                       │                   │  0  │               │  0  │                │  0  │            │  0  │
+│                       │                   ├─────┤               ├─────┤                ├─────┤            ├─────┤
+│                       │                   │  0  │               │  0  │                │  0  │            │  0  │
+│                       │                   ├─────┤               ├─────┤                ├─────┤            ├─────┤
+│                       │                   │  0  │               │  0  │                │  0  │            │  0  │
+│                       │                   ├─────┤               ├─────┤                ├─────┤            ├─────┤
+└───────────────────────┘                   │  0  │               │  0  │                │  0  │            │  0  │
+                                            ├─────┤               ├─────┤                ├─────┤            ├─────┤
+                                            │ ... │               │ ... │                │ ... │            │ ... │
+                                            ├─────┤               ├─────┤                ├─────┤            ├─────┤
+                                            │  0  │               │  0  │                │  0  │            │  0  │
+                                            ├─────┤               ├─────┤                ├─────┤            ├─────┤
+                                            │  0  │               │  0  │                │  0  │            │  0  │
+                                            └─────┘               └─────┘                └─────┘            └─────┘
+```
+未决信号集(pending)默认是0,发送但是进程未处理后改为1
+屏蔽信号集(mask)默认是0 用户设置set后mask对应位置为
+
+<signal.h>
+处理自己定义的信号集:
+- int sigemptyset(sigset_t *set) 清空集合,对应二进制位改0
+- int sigfillset(sigset_t *set)  对应二进制位改1
+- int sigaddset(sigset_t *set, int signum) 加入到集合
+- int sigdeleteset(sigset_t *set, int signum) 拿走集合
+- int sigdeleteset(const sigset_t *set, int signum)是否集合中
+
+添加到屏蔽信号集:**屏蔽或者解除屏蔽**
+int sigprocmask(int how, const sigset_t *set, sigset_t *oldset)
+- how 
+> - SIG_BLOCK  相当于给内核mask |= user_mask
+> - SIG_UNBLOCK 相当于给内核mask |= (~user_mask)
+> - SIG_SETMASK  内核mask=user_mask 不推荐使用
+
+拿到未决信号集
+int sigpending(sigset_t *set);
+这里好像没有看到拿mask信号的.//TODO 确认下
+测试:对SIG_INT屏蔽 发送信号后看是否在未决信号集中
+```cpp
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <pthread.h>
+#include <sys/signal.h>
+
+void sys_err(const char* str){
+    perror(str);
+    exit(1);
+}
+
+void print_sig(const sigset_t *set){
+    int i;
+    for(i = 1; i < 32; i++){
+        if(sigismember(set, i)){
+            printf("sig %d in pending set\n",i);
+        }
+    }
+}
+
+int main(int argc, char* argv[])
+{
+    sigset_t set,old_set, pend_set;
+    int ret = 0;
+    sigemptyset(&set);
+    sigaddset(&set, SIGINT);
+    ret = sigprocmask(SIG_BLOCK, &set, &old_set);
+    if(ret == -1){
+        sys_err("proc mask err");
+    }
+
+
+    while(1){
+
+    ret = sigpending(&pend_set);
+    if(ret == -1){
+        sys_err("proc mask err");
+    }
+        print_sig(&pend_set);
+        sleep(1);
+    }
+    return 0;
+}
+```
+### 信号处理器
+#### signal
+signal 不是posix标准,是ansi定义,不同linux版本可能定义和函数不同
+实现简单.signal是注册一个信号捕捉函数.
+
+typedef void (*sighandler_t )(int) 定义一个类型,这个类型是一个函数,函数返回void,入参支持一个入参int类型
+sighandler_t signal(int signum, sighandler_t handler)
+- signum 信号
+- handler 注册函数指针
+测试
+```cpp
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <pthread.h>
+#include <sys/signal.h>
+
+void sys_err(const char* str){
+    perror(str);
+    exit(1);
+}
+
+void sig_cache(int signo){
+    printf("get signo %d\n",signo);
+}
+
+int main(int argc, char* argv[])
+{
+    signal(SIGINT, sig_cache);
+    while(1);
+    return 0;
+}
+```
+
+返回
+```
+➜  alarm ././signal
+^Cget signo 2
+^Cget signo 2
+^Cget signo 2
+^Cget signo 2
+^Cget signo 2
+^Cget signo 2
+^Cget signo 2
+^Z
+[1]  + 15713 suspended  ./signal
+```
+
+#### sigaction
+<signal.h>
+sigaction  posix标准,通用标准.
+int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)
+- signum 信号
+- act 入参,新的处理方式
+- oldact 回参,旧的处理方式
+struct sigaction
+```cpp
+struct sigaction{
+    void (*sa_handler)(int);//指定处理函数指针
+    void (*sa_sigaction)(int, siginfo_t *, void *);//一般不用 携带复杂数据给进程,void *
+    sigset_t sa_mask;//**重点**只工作与信号捕捉函数执行期间.和进程的mask不同.相当于在处理信号的时候用sa_mask替换掉pcb中的mask
+    int sa_flags;//处理方式.默认0的时候sa_mask不用屏蔽信号,会自己屏蔽.
+    void (*sa_restorer)(void);//废弃
+}
+```
+返回:
+- ok 0
+- gg -1 errno
+
+
+sa_mask是使用意义:
+```ditaa
+                                      
+             3.new SIG_INT comes───── 
+                  │                   
+                  │                   
+     handler      │                   
+                  │                   
+┌────────────────◀▼────1.SIG_INT────  
+├────────────────┤                    
+├────────────────┤                    
+├────────────────┤                    
+├────────────────┤                    
+├────────────────┤                    
+├────────────────┤                    
+├────────────────┤   2.instruction    
+├────────────────┤◀───runed here──────
+├────────────────┤                    
+├────────────────┤                    
+├────────────────┤                    
+├────────────────┤                    
+├────────────────┤                    
+├────────────────┤                    
+├────────────────┤                    
+└────────────────┘                    
+```
+如果信号处理器在处理某个信号(如SIG_INT)执行到一半的时候新的信号(如SIG_INT)到来,按照信号处理的机制,因该是需要先处理新的信号.这样会导致可能死循环(如果相同的信号不断重发).
+为了避免这种情况,sa_mask中加入处理中的信号或者需要屏蔽的信号,等信号处理器处理时pcb的mask先根据sa_mask屏蔽信号,到了信号处理器处理完之后pab的mask再恢复会原来
+
+测试
+```cpp
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <pthread.h>
+#include <sys/signal.h>
+
+void sys_err(const char* str){
+    perror(str);
+    exit(1);
+}
+
+void cat_sig(int iSig){
+    if(iSig == SIGQUIT){
+    printf("catch SIGQUIT sig %d\n", iSig);
+    }
+    if(iSig == SIGINT){
+
+    printf("catch SIGINT sig %d\n", iSig);
+    }
+    else{
+
+    printf("catch sig %d\n", iSig);
+    }
+    return;
+}
+
+int main(int argc, char* argv[])
+{
+    struct sigaction act, oldact;
+
+    act.sa_handler = cat_sig;
+    sigemptyset(&(act.sa_mask));
+    act.sa_flags = 0;
+
+    int ret = sigaction(SIGINT, &act, &oldact);
+    if(ret == -1){
+        sys_err("sigaction err");
+    }
+
+    ret = sigaction(SIGQUIT, &act, &oldact);
+    if(ret == -1){
+        sys_err("sigaction err");
+    }
+
+    while(1);
+    return 0;
+}
+
+```
+res
+```
+➜  alarm ././sigaction
+^Ccatch SIGINT sig 2
+^\catch SIGQUIT sig 3
+catch sig 3
+^Ccatch SIGINT sig 2
+^Z
+[3]  + 28653 suspended  ./sigaction
+```
+
+#### 信号处理器特性
+- pcb的屏蔽字mask在信号处理器处理期间,暂时不是mask,是**设置的sa_mask**.
+- 某个信号sig在信号处理器处理期间,sig信号自动被屏蔽(前提:flag是0)
+- 阻塞常规信号不支持排队,对此产生只记录一个.(后面32个信号支持排队)
+
+特性测试:sig在信号处理期间,被自动屏蔽
+```cpp
+➜  alarm cat sigaction.c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <pthread.h>
+#include <sys/signal.h>
+
+void sys_err(const char* str){
+    perror(str);
+    exit(1);
+}
+
+void cat_sig(int iSig){
+    if(iSig == SIGQUIT){
+        printf("catch SIGQUIT sig %d start =======\n", iSig);
+        sleep(4);
+        printf("catch SIGQUIT sig %d end ========\n", iSig);
+    }
+    if(iSig == SIGINT){
+
+        printf("catch SIGINT sig %d start =======\n", iSig);
+        sleep(4);
+        printf("catch SIGINT sig %d end ========\n", iSig);
+    }
+    else{
+
+        printf("catch sig %d\n", iSig);
+    }
+    return;
+}
+
+int main(int argc, char* argv[])
+{
+    struct sigaction act, oldact;
+
+    act.sa_handler = cat_sig;
+    sigemptyset(&(act.sa_mask));
+    act.sa_flags = 0;
+
+    int ret = sigaction(SIGINT, &act, &oldact);
+    if(ret == -1){
+        sys_err("sigaction err");
+    }
+
+    ret = sigaction(SIGQUIT, &act, &oldact);
+    if(ret == -1){
+        sys_err("sigaction err");
+    }
+
+    while(1);
+    return 0;
+}
+```
+res
+```
+^Ccatch SIGINT sig 2 start =======
+catch SIGINT sig 2 end ========
+^Ccatch SIGINT sig 2 start =======
+^\catch SIGQUIT sig 3 start =======
+^C^\catch SIGQUIT sig 3 end ========
+catch sig 3
+catch SIGQUIT sig 3 start =======
+catch SIGQUIT sig 3 end ========
+catch sig 3
+catch SIGINT sig 2 end ========
+catch SIGINT sig 2 start =======
+catch SIGINT sig 2 end ========
+^Z
+[8]  + 32380 suspended  ./sigaction
+➜  alarm
+```
+可以看到,在信号2 3 都中断的时候,两个信号都会被屏蔽.
+但是其他信号可以进入.
+
+**如果有希望在处理sigA的时候屏蔽的sigB,需要对sa_mask进行sigaddset操作.**
+
+#### 信号处理机制
+进程在产生内核调用的时候才可能拿到信号
+```ditaa
+┌────────────────────────────────────────────────────────────────────────────────────┐
+│                                                                       ┌──────────┐ │
+│                                                                       │          │ │
+│ ┌────────────────────┐          ┌────────────────────┐     ┌────────────────────┐│ │
+│ │                    │          │ 3.do_signal(). if  │     │                    ││ │
+│ │  2.after sys func  │          │    proc defined    │     │5.sys_sigreturn().ke││ │
+│ │called, kernel check│          │   signaction for   │     │ rnel get call back ││ │
+│ │   pending signal   │          │pending signal, call│     │from user. proc will││ │
+│ │ set.if signal need │ ────────▶│  sigaction handle  │     │  be excuted from   ││ │
+│ │  to be dealed by   │          │ function.(else, do │     │    instruction     ││ │
+│ │process, do_signal()│          │  default action)   │     │inturupted last time││ │
+│ │                    │          │                    │     │                    ││ │
+│ └────────────────────┘          └────────────────────┘     └────────────────────┘│ │
+│            ▲                               │                          ▲          │ │
+├────────────┼───────────────────────────────┼──────────────────────────┼──────────┼─┤
+│            │                               │                          │          │ │
+│            │                               │                          │          │ │
+│            │                               │                          │          │ │
+│            │                               ▼                          │          │ │
+│ ┌────────────────────┐          ┌────────────────────┐                │          │ │
+│ │     1.in main      │          │       4.void       │                │          │ │
+│ │ process.when proc  │          │  sighandler(int).  │                │          │ │
+│ │need to switch into │          │proc call sighandler│                │          │ │
+│ │ kernel(for reason  │          │  for signal.after  │                │          │ │
+│ │   ex: interrupt,   │          │sighandler returned,│────────────────┘          │ │
+│ │ exception, or call │          │     proc call      │                           │ │
+│ │  sys funcs likes   │          │  sigreturn() for   │                           │ │
+│ │ printf, write ...) │          │  switch to kernel  │                           │ │
+│ └────────────────────┘          └────────────────────┘                           │ │
+│            ▲                                                                     │ │
+│            │                                                                     │ │
+│            │                                                                     │ │
+│            │                                                                     │ │
+│            └─────────────────────────────────────────────────────────────────────┘ │
+│                                                                                    │
+└────────────────────────────────────────────────────────────────────────────────────┘
+```
+1.在主函数因为一些原因需要进行内核态切换(例如程序中断,异常或者系统调用系统函数例如写,pirntf之类)
+2.系统函数调用完后,系统会检查当前进程pcb的peeding signal set(未决信号集)是否有待处理的信号.如果有,调用do_signal函数
+3.do_signal.如果程序有定义对某信号的sig_handler,系统需要从内核态向内核态调用该sig_handler(进入用户态后直接调用handler,不管main);否则调用默认处理
+4.进入用户sighandler处理完后,进程用户态需要返回给内核态的do_signal,因此调用sys_sigreturn切换回内核态.
+5.从用户态返回到内核态,sys_sigreturn拿到请求,让程序从之前终端的位置继续执行
+
+### SIGCHLD
+只要子进程状态变化,就产生.
+- 子终止
+- 子暂停
+- 子停止后唤醒
+
+借助sigchld回收子进程
+```cpp
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <pthread.h>
+#include <signal.h>
+
+void sys_err(const char* str){
+    perror(str);
+    exit(1);
+}
+
+void cat_child(int sig){
+    printf("get child sig=%d\n",sig);
+}
+
+int main(int argc, char* argv[])
+{
+    int i = 0;
+    pid_t pid_child;
+    for(i = 0; i < 5; i++)
+    {
+        pid_child = fork();
+        if(pid_child < 0) {
+            sys_err("fork err");
+        }
+        if(pid_child == 0){
+            break;
+        }
+    }
+
+    if(pid_child > 0){
+        struct sigaction act, oldact;
+        act.sa_handler=cat_child;
+        sigemptyset(&act.sa_mask);
+        act.sa_flags = 0;
+        int ret = sigaction( SIGCHLD, &act, &oldact);
+        if(ret == -1)
+        {
+            sys_err("sigaction err");
+        }
+        while(1);
+    }
+
+    else{
+        printf("i am %dth child\n", i);
+        sleep(i);
+        printf("%dth child end\n", i);
+    }
+    return 0;
+}
+```
+
+
+```
+➜  alarm ./catch_child
+i am 0th child
+0th child end
+get child sig=17
+i am 2th child
+i am 3th child
+i am 4th child
+i am 1th child
+1th child end
+get child sig=17
+2th child end
+get child sig=17
+3th child end
+get child sig=17
+4th child end
+get child sig=17
+^C
+```
+注意:这样的写法会有僵尸进程
+```
+➜  ~ ps aux|grep catch_child
+paralle+ 12230  100  0.0   4212   356 pts/2    R+   16:30   0:11 ./catch_child
+paralle+ 12231  0.0  0.0      0     0 pts/2    Z+   16:30   0:00 [catch_child] <defunct>
+paralle+ 12232  0.0  0.0      0     0 pts/2    Z+   16:30   0:00 [catch_child] <defunct>
+paralle+ 12233  0.0  0.0      0     0 pts/2    Z+   16:30   0:00 [catch_child] <defunct>
+paralle+ 12234  0.0  0.0      0     0 pts/2    Z+   16:30   0:00 [catch_child] <defunct>
+paralle+ 12235  0.0  0.0      0     0 pts/2    Z+   16:30   0:00 [catch_child] <defunct>
+```
+因为父没有wait子,只能僵尸
+分析另外一种情况
+
+```cpp
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <pthread.h>
+#include <signal.h>
+
+void sys_err(const char* str){
+    perror(str);
+    exit(1);
+}
+
+void cat_child(int sig){
+    printf("get child sig=%d\n",sig);
+    pid_t pid_child = wait(NULL);
+    printf("child pid %d is dead\n", pid_child);
+}
+
+int main(int argc, char* argv[])
+{
+    int i = 0;
+    pid_t pid_child;
+    for(i = 0; i < 35; i++)
+    {
+        pid_child = fork();
+        if(pid_child < 0) {
+            sys_err("fork err");
+        }
+        if(pid_child == 0){
+            break;
+        }
+    }
+
+    if(pid_child > 0){
+        struct sigaction act, oldact;
+        act.sa_handler=cat_child;
+        sigemptyset(&act.sa_mask);
+        act.sa_flags = 0;
+        int ret = sigaction( SIGCHLD, &act, &oldact);
+        if(ret == -1)
+        {
+            sys_err("sigaction err");
+        }
+        while(1);
+    }
+
+    else{
+        printf("i am %dth child\n", i);
+        printf("%dth child end\n", i);
+    }
+    return 0;
+}
+```
+
+看到很多子进程gg了.但是ps看到
+```
+➜  ~ ps aux|grep catch_child
+paralle+ 14159  108  0.0   4212   444 pts/2    R+   16:36   0:04 ./catch_child
+paralle+ 14175  0.0  0.0      0     0 pts/2    Z+   16:36   0:00 [catch_child] <defunct>
+paralle+ 14187  0.0  0.0      0     0 pts/2    Z+   16:36   0:00 [catch_child] <defunct>
+paralle+ 14188  0.0  0.0      0     0 pts/2    Z+   16:36   0:00 [catch_child] <defunct>
+paralle+ 14189  0.0  0.0      0     0 pts/2    Z+   16:36   0:00 [catch_child] <defunct>
+paralle+ 14190  0.0  0.0      0     0 pts/2    Z+   16:36   0:00 [catch_child] <defunct>
+paralle+ 14191  0.0  0.0      0     0 pts/2    Z+   16:36   0:00 [catch_child] <defunct>
+paralle+ 14192  0.0  0.0      0     0 pts/2    Z+   16:36   0:00 [catch_child] <defunct>
+paralle+ 14193  0.0  0.0      0     0 pts/2    Z+   16:36   0:00 [catch_child] <defunct>
+paralle+ 14194  0.0  0.0      0     0 pts/2    Z+   16:36   0:00 [catch_child] <defunct>
+```
+这里子进程都直接死了,父进程靠的是sighandler进行回收(wait),如果多个子进程死了,事实上父进程只能拿到一个sigchld信号.这里wait调整下
+```cpp
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <pthread.h>
+#include <signal.h>
+#include <sys/wait.h>
+
+void sys_err(const char* str){
+    perror(str);
+    exit(1);
+}
+
+void cat_child(int sig){
+    printf("get child sig=%d\n",sig);
+    pid_t pid_child ;
+    while((pid_child = wait(NULL)) > 0){
+        printf("child pid %d is dead\n", pid_child);
+    }
+}
+
+int main(int argc, char* argv[])
+{
+    int i = 0;
+    pid_t pid_child;
+    for(i = 0; i < 35; i++)
+    {
+        pid_child = fork();
+        if(pid_child < 0) {
+            sys_err("fork err");
+        }
+        if(pid_child == 0){
+            break;
+        }
+    }
+
+    if(pid_child > 0){
+        struct sigaction act, oldact;
+        act.sa_handler=cat_child;
+        sigemptyset(&act.sa_mask);
+        act.sa_flags = 0;
+        int ret = sigaction( SIGCHLD, &act, &oldact);
+        if(ret == -1)
+        {
+            sys_err("sigaction err");
+        }
+        while(1);
+    }
+
+    else{
+        printf("i am %dth child\n", i);
+        printf("%dth child end\n", i);
+    }
+    return 0;
+}
+```
+执行的时候ps看到
+```
+➜  ~ ps aux|grep catch_child
+paralle+ 15765 93.0  0.0   4212   444 pts/2    R+   16:41   0:04 ./catch_child
+paralle+ 15818  0.0  0.0   9088   668 pts/1    R+   16:41   0:00 grep --color=auto --exclude-dir=.bzr --exclude-dir=CVS --exclude-dir=.git --exclude-dir=.hg --exclude-dir=.svn catch_child
+```
+都回收掉,没有僵尸进程.因为这时候能把当前gg的都回收掉,即将gg的能在下次回收.
+
+问题:如果子进程在父进程注册函数之前就gg了,按道理子进程sleep以下可以解决.
+如果子进程不sleep,但是没有必要再fork之前进行监听:**设置屏蔽**.在进程开始的时候屏蔽sigchld信号,到了父进程设置了signalhandler之后再解除屏蔽.
+
+
+### 中断系统调用
+系统调用分两类
+- 慢速系统调用 可能会使进程永远阻塞的一类.如果阻塞期间收到信号,**该系统调用会被中断,不再继续执行**;也可以设置系统调用是否重启.例如:read write pause wait
+- 其他系统调用 getpid getppid 
+
+可以使用sigaction对这些信号进行处理(例如信号19无法被屏蔽),因为这样的信号只能被捕捉. 在sa_flags中设置中断后是否重启.
+- SA_INTERRUT 不重启 默认是这个行为
+- SA_RESTART 重启 重启中断前的系统调用
+
+补充:
+- 如果希望sighandler拿到参数,sa_flags需要设定为SA_SIGINFO.这时候sa_sigaction需要设置.
+- 如果希望sighandler执行期间不阻塞相同的信号,可以将sa_flags设置为SA_NODEFER(但是sa_mask设置了就不生效,也就是sa_mask优先级比这个sa_flags高)
+
+//TODO 纳入大框图
+
+
