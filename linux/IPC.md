@@ -1984,7 +1984,7 @@ man 7 signal看到手册解释
 int kill(pid_t pid, int sig)
 sig:发送的信号.
 pid:(和waitpid类似)
-- >0 指定pid
+- 大于0 指定pid
 - 0 同gid所有进程
 - <0 给gid是|pid|的进程发送信号
 - -1 给能发送的所有进程都发 进程只能向自己创建的进程发信号.
