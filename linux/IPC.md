@@ -3263,6 +3263,6 @@ paralle+ 15818  0.0  0.0   9088   668 pts/1    R+   16:41   0:00 grep --color=au
 - 如果希望信号发送的时候带上参数,sa_flags需要设定为SA_SIGINFO.这时候sa_sigaction需要设置.
 - 如果希望sighandler执行期间不阻塞相同的信号,可以将sa_flags设置为SA_NODEFER(但是sa_mask设置了就不生效,也就是sa_mask优先级比这个sa_flags高)
 
-//TODO 纳入大框图
+
 
 
