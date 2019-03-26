@@ -444,4 +444,68 @@ t_cli_size = (socklen_t * )malloc(sizeof(socklen_t));
 这里如果sizeof没有设置,不能正确拿回ip port
 
 
+使用客户端写
+```cpp
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <pthread.h>
+#include <sys/types.h>          /* See NOTES */
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <ctype.h>
+
+#define BUFSIZE 4096
+void sys_err(const char* str){
+    perror(str);
+    exit(1);
+}
+
+int main(int argc, char* argv[])
+{
+
+    int cfd;
+    cfd = socket(AF_INET, SOCK_STREAM, 0);
+    if(cfd==-1){
+        sys_err("socket err");
+
+    }
+    struct sockaddr t_addr;
+    struct sockaddr_in t_svr;
+    t_svr.sin_family = AF_INET;
+    t_svr.sin_port = htons(9999);
+    t_svr.sin_addr.s_addr = htonl(INADDR_ANY);
+    socklen_t t_svr_size = sizeof(t_svr);
+
+    socklen_t *t_cli_size;
+    t_cli_size = (socklen_t * )malloc(sizeof(socklen_t));
+    *t_cli_size = sizeof(struct sockaddr_in);
+
+    t_addr.sa_family= AF_INET;
+    /* t_addr.sin_port = htons(9999); t_addr.sin_addr.s_addr = htonl(INADDR_ANY); */
+    int ret =connect(cfd, (struct sockaddr*)&t_svr, t_svr_size);
+    if(ret == -1)
+    {
+        sys_err("socket err");
+
+    }
+    char b[4096];
+    while(1){
+        scanf("%s",b);
+
+        write(cfd, b,sizeof(b));
+
+        ret = read(cfd, b, sizeof(b));
+        if(ret){
+            printf("%s\n", b);
+        }
+    }
+
+    return 0;
+}
+
+```
+
 
