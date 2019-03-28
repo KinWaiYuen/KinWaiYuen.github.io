@@ -98,24 +98,36 @@ tcpdump: listening on lo, link-type EN10MB (Ethernet), capture size 262144 bytes
 ### 发数据
 **发送**:23:34:03.174224
 [P.][P.], cksum 0x0211 (incorrect -> 0x4387), seq 0:**1000**, ack **1**, win 342, options [nop,nop,TS val 17700438 ecr 17700438], length **1000**
+
 **接收**:23:34:03.174590
 [P.][P.], cksum 0xfe2d (incorrect -> 0xb238), seq 1:**6**, ack **1001**, win 334, options [nop,nop,TS val 17700439 ecr 17700438], length **5**
+
 **发送**:23:34:03.175093 
 [.], cksum 0xfe28 (incorrect -> 0x75ba), ack **6**, win 342, options [nop,nop,TS val 17700439 ecr 17700439], length 0
 
+================
+
 **发送**:23:34:04.175934
 [P.], cksum 0x0211 (incorrect -> 0x9bef), seq **1000**:**2000**, ack **6**, win 342, options [nop,nop,TS val 17701440 ecr 17700439], length **1000**
+
 **接收**:23:34:04.176114 
 [P.], cksum 0xfe2d (incorrect -> 0xa67f), seq **6**:**11**, ack 2001, win 327, options [nop,nop,TS val 17701440 ecr 17701440], length **5**
+
 **发送**:23:34:04.176303
 [.], cksum 0xfe28 (incorrect -> 0x69fb), ack **11**, win 342, options [nop,nop,TS val 17701440 ecr 17701440], length 0
 
+=============
+
 **发送**:23:34:05.177921
 [P.], cksum 0x0211 (incorrect -> 0x902f), seq **2000**:**3000**, ack **11**, win 342, options [nop,nop,TS val 17702442 ecr 17701440], length **1000**
+
 **接收**:23:34:05.178091
 [P.], cksum 0xfe2d (incorrect -> 0x9ac5), seq **11**:**16**, ack **3001**, win 320, options [nop,nop,TS val 17702442 ecr 17702442], length **5**
+
 **发送**:23:34:05.178195
 [.], cksum 0xfe28 (incorrect -> 0x5e3a), ack **16**, win 342, options [nop,nop,TS val 17702442 ecr 17702442], length 0
+
+===========
 
 **发送**:23:34:06.179598 
 [P.], cksum 0x0211 (incorrect -> 0x846e), seq **3000**:**4000**, ack 16, win 342, options [nop,nop,TS val 17703444 ecr 17702442], length **1000**
