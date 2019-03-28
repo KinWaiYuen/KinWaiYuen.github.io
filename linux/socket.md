@@ -508,4 +508,387 @@ int main(int argc, char* argv[])
 
 ```
 
+注意:
+fwrite和fread不能用在socket编程,因为这两个函数需要文件结构指针,socket没有.
+
+
+## 简单服务(使用多进程)
+要点:
+- 父进程listen fd,如果监听成功,fork子进程,子进程处理通信逻辑
+- 考虑到wait的阻塞情况,使用信号SIGCHLD,如果子进程gg,父进程通过信号回收子进程(没有子进程回收的版本会存在僵尸进程,因为子进程没有被wait)
+
+封装了异常逻辑的函数
+
+```cpp
+//wrap.h
+#ifndef __WRAP_H_
+#define __WRAP_H_
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <pthread.h>
+#include <sys/types.h>          /* See NOTES */
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <ctype.h>
+#include <sys/signal.h>
+#include <strings.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+int Socket(int domain, int type, int protocol);
+int Listen(int sockfd, int backlog);
+int Accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen);
+ssize_t Read(int fd, void *buf, size_t count);
+ssize_t Write(int fd, const void *buf, size_t count);
+int Close(int fd);
+ssize_t Writen(int fd, const void *buf, size_t count);
+ssize_t Readn(int fd, void *buf, size_t count);
+int Bind(int sockfd, const struct sockaddr *addr,
+         socklen_t addrlen);
+void sys_err(const char* str);
+#endif
+```
+
+```cpp
+#include "wrap.h"
+
+void sys_err(const char* str){
+    perror(str);
+    exit(1);
+}
+
+
+int Socket(int domain, int type, int protocol){
+    int iRet;
+    iRet= socket( AF_INET, SOCK_STREAM, 0 );
+    if(iRet == -1){
+        sys_err("socket err");
+    }
+    return iRet;
+}
+
+int Listen(int sockfd, int backlog){
+
+    int iRet = listen(sockfd, backlog);
+    if(iRet== -1){
+        sys_err("listen err");
+    }
+    return 0;
+}
+
+int Bind(int sockfd, const struct sockaddr *addr,
+         socklen_t addrlen)
+{
+    int iRet = bind(sockfd, addr,  addrlen);
+    if(iRet== -1){
+        sys_err("bind err");
+    }
+    return 0;
+
+}
+
+int Accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen)
+{
+    int n;
+again:
+    if((n = accept(sockfd, addr, addrlen)) < 0){
+        if((errno == ECONNABORTED) || (errno == EINTR)|| (errno == ERRCONNRESET)){
+            goto again;
+        }
+        else{
+            sys_err("accept err");
+        }
+    }
+    return n;
+
+}
+
+ssize_t Write(int fd, const void *buf, size_t count){
+    ssize_t n;
+again:
+    if((n = write(fd, buf,count)) == -1){
+        if(errno == EINTR){
+            goto again;
+        }
+        else
+        {
+            return -1;
+        }
+    }
+    return n;
+}
+
+int Close(int fd){
+    int n;
+    if((n = close(fd)) == -1){
+        sys_err("close err");
+    }
+    return n;
+}
+
+ssize_t Read(int fd, void *buf, size_t count){
+    ssize_t n;
+again:
+    if((n = read(fd, buf,count)) == -1){
+        if(errno == EINTR)
+            goto again;
+        else
+            return -1;
+    }
+    return n;
+}
+
+ssize_t Readn(int fd, void *buf, size_t count){
+    ssize_t nRead;
+    size_t nLeft=count;
+    char* ptr;
+    ptr = (char*)buf;
+    while(nLeft > 0){
+
+        if((nRead = read(fd, buf,count)) == -1){
+            if(errno == EINTR)
+                nRead = 0;
+            else
+                return -1;
+        }
+        else if(nRead == 0){
+            break;
+        }
+
+        nLeft = count - nRead;
+        ptr+=nRead;
+    }
+    return count - nLeft;
+
+}
+
+ssize_t Writen(int fd, const void *buf, size_t count){
+    ssize_t nWrite;
+    size_t nLeft = count;
+    char* ptr;
+    ptr = (char* )buf;
+    while(nLeft > 0){
+        if((nWrite = write(fd, buf,count)) == -1){
+            if(errno == EINTR){
+                nWrite = 0;
+            }
+            else
+            {
+                return -1;
+            }
+        }
+        else if(nWrite == 0){
+            break;
+        }
+        nLeft = count - nWrite;
+        ptr += nWrite;
+    }
+    return count - nWrite;
+}
+```
+
+
+```cpp
+#include "wrap.h"
+
+void cat_sig(int iSig){
+    if(iSig ==SIGCHLD){
+        printf("catch SIGQUIT sig %d start =======\n", iSig);
+        pid_t pChildId= 0;
+
+        while((pChildId = wait(NULL)) > 0){
+            printf("child id %d over\n",pChildId);
+        }
+        printf("catch SIGQUIT sig %d end ========\n", iSig);
+    }
+    if(iSig == SIGINT){
+
+        printf("catch SIGINT sig %d start =======\n", iSig);
+
+        printf("catch SIGINT sig %d end ========\n", iSig);
+        exit(1);
+    }
+    else{
+
+        printf("catch sig %d\n", iSig);
+    }
+    return;
+}
+
+int main(int argc, char* argv[])
+{
+    if(argc < 2){
+        printf("usage: bin port\n");
+        return 0;
+    }
+
+
+    int lfd, cfd;
+    lfd = Socket(AF_INET, SOCK_STREAM, 0);
+
+
+    struct sockaddr_in svr_addr;
+    /* memset(&svr_addr, 0, sizeof(svr_addr)); */
+    bzero(&svr_addr, sizeof(svr_addr));
+    svr_addr.sin_family = AF_INET;
+    int port = atoi(argv[1]);
+    printf("====svr:port=%d======\n", port);
+    svr_addr.sin_port = htons(port);
+    svr_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    Bind(lfd,(struct sockaddr *)&svr_addr, sizeof(svr_addr) );
+
+    Listen(lfd,128);
+
+    struct sockaddr_in cli_addr;
+    socklen_t cli_addr_size = sizeof(cli_addr);
+    pid_t pid;
+    while(1){
+        cfd = Accept(lfd, (struct sockaddr *)&cli_addr, &cli_addr_size);
+
+        pid = fork();
+        if(pid < 0){
+            sys_err("foerk err");
+        }
+        else if(pid == 0){
+            break;
+        }else {
+            struct sigaction act, oldact;
+            act.sa_handler = cat_sig;
+            sigemptyset(&(act.sa_mask));
+            act.sa_flags = 0;
+
+            int ret = sigaction(SIGCHLD, &act, &oldact);
+            if(ret == -1){
+                sys_err("sigaction err");
+            }
+            close(cfd);
+        }
+
+    }
+
+    if(pid == 0){
+        while(1){
+            char buf[4096];
+            int ret, i;
+            close(lfd);
+            ret = Read(cfd, buf, sizeof(buf));
+            if(ret == 0){
+                close(cfd);//这样连接不是还是存在?
+
+                exit(1);
+            }
+            for(i = 0; i < ret; i++){
+                buf[i]=toupper(buf[i]);
+            }
+            write(cfd, buf, ret);
+            write(STDOUT_FILENO, buf,ret);
+
+        }
+    }
+
+
+
+    return 0;
+}
+```
+
+注意:在centos7中外部访问可能被防火墙屏蔽.使用
+
+firewall-cmd --zone=public --add-port=80/tcp(永久生效再加上 --permanent)
+可以添加端口
+ex:
+sudo firewall-cmd --zone=public --add-port=9999/tcp --permanent
+
+//TODO 进程间共享fd? 应该只是刚fork的时候一样.否则子进程关闭fd会影响全局.  待验证
+
+## 简单服务(多线程)
+```cpp
+#include "wrap.h"
+
+void tfn(void *arg){
+    while(1){
+        char buf[4096];
+        int ret, i;
+        int cfd = (int)arg;
+        printf("in sub thread.cfd=%d\n",cfd);
+        ret = Read(cfd, buf, sizeof(buf));
+        if(ret == 0){
+            Close(cfd);//这样连接不是还是存在?
+
+            pthread_exit((void*)0);
+        }
+        for(i = 0; i < ret; i++){
+            buf[i]=toupper(buf[i]);
+        }
+        Write(cfd, buf, ret);
+        Write(STDOUT_FILENO, buf,ret);
+
+    }
+    printf("thread %lu gg\n", pthread_self());
+    pthread_exit((void*)0);
+}
+
+
+int main(int argc, char* argv[])
+{
+    if(argc < 2){
+        printf("usage: bin port\n");
+        return 0;
+    }
+
+
+    int lfd, cfd;
+    lfd = Socket(AF_INET, SOCK_STREAM, 0);
+
+
+    struct sockaddr_in svr_addr;
+    /* memset(&svr_addr, 0, sizeof(svr_addr)); */
+    bzero(&svr_addr, sizeof(svr_addr));
+    svr_addr.sin_family = AF_INET;
+    int port = atoi(argv[1]);
+    printf("====svr:port=%d======\n", port);
+    svr_addr.sin_port = htons(port);
+    svr_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    Bind(lfd,(struct sockaddr *)&svr_addr, sizeof(svr_addr) );
+
+    Listen(lfd,128);
+
+    struct sockaddr_in cli_addr;
+    socklen_t cli_addr_size = sizeof(cli_addr);
+    pthread_t tid;
+    while(1){
+        cfd = Accept(lfd, (struct sockaddr *)&cli_addr, &cli_addr_size);
+
+        int ret = pthread_create(&tid, NULL, tfn, (void *) cfd);
+        if(ret < 0){
+            sys_err("err");
+        }
+        pthread_detach(tid);
+        printf("main thread cfd is %d\n", cfd);
+        //close(cfd);//线程:因为线程共享fd,这里主线程不能关闭fd
+
+    }
+
+
+
+
+    pthread_exit((void*)0);
+}
+
+```
+### 注意:主线程不要关闭fd,因为fd共享.
+
+### 注意:read = 0是关闭的意义:
+如果fd就是文件,对端没有关闭(就是打开)的时候,是会阻塞等待读的.
+如果返回时0,说明对端已经关闭.socket中就是对端写缓冲已经gg,意味着已经发生了close.(事实上对端shutdown(fd,SHUT_WR)的时候,就会发起了close请求).
+本端发现对端不能读了,自然fd在read的时候返回0.
+
+### 注意:read返回-1要进一步区分
+errno是EAGAIN或者EWOULDBLOCK表示读是非阻塞读,可以继续再读
+errno是EINTR是被中断,被系统中断.是应该再等下的
+errno是**ECONNRESET**表示当前连接被重置,很可能是在accept的时候对端没有回包ack,内核会重置.
+errno是其他情况才要gg
 
