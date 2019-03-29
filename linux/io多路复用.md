@@ -1390,5 +1390,10 @@ int main(int argc, char* argv[])
     return 0;
 }
 ```
+总结:
+1.所有行为通过epoll触发
+2.所有行为的fd都是非阻塞
+3.使用epoll驱动事件发生
+4.事件a如果需要epoll后续操作,需要更改epoll事件属性,继续监听
 
 
