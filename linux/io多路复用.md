@@ -403,6 +403,22 @@ int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event)
 - op 操作类型 EPOLL_CTL_ADD  EPOLL_CTL_DEL EPOLL_CTL_MOD
 - fd 监听的fd
 - event eopll_event结构.保存包括fd,关心事件类型信息
+**注意**
+这里挂在树上的时候,把fd和epoll_event都写上了.实际上epoll_event.data的内容是**用户自己定义**的.后续实例代码写了fd,但是查看epoll_event内容
+```cpp
+           typedef union epoll_data {
+               void        *ptr;
+               int          fd;
+               uint32_t     u32;
+               uint64_t     u64;
+           } epoll_data_t;
+
+           struct epoll_event {
+               uint32_t     events;      /* Epoll events */
+               epoll_data_t data;        /* User data variable */
+           };
+```
+所以往树上挂的时候**根据实际使用需求写入data数据**
 
 ```ditaa
                    ┌────┐                 
@@ -798,3 +814,581 @@ ET非阻塞 -->忙轮询,读完数据.
 如果epoll通知你fd可以写数据了。然后你啦啦啦的打算写100B数据，但是内核buf只有50B的可用
 空间，这时候，你的进程就被阻塞了。。。
 所以说，用了epoll不能保证你的进程在读写的时候不会阻塞
+
+实验:
+svr
+```cpp
+#include "wrap.h"
+#include <unistd.h>
+#include <sys/epoll.h>
+
+#define OPEN_MAX 5000
+
+
+int main(int argc, char* argv[])
+{
+    if(argc < 2){
+        printf("usage: bin port\n");
+        return 0;
+    }
+
+
+    int lfd, cfd, efd;
+    lfd = Socket(AF_INET, SOCK_STREAM, 0);
+
+
+    struct sockaddr_in svr_addr;
+    /* memset(&svr_addr, 0, sizeof(svr_addr)); */
+    int opt  = 1;
+    setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    bzero(&svr_addr, sizeof(svr_addr));
+    svr_addr.sin_family = AF_INET;
+    int port = atoi(argv[1]);
+    printf("====svr:port=%d======\n", port);
+    svr_addr.sin_port = htons(port);
+    svr_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    Bind(lfd,(struct sockaddr *)&svr_addr, sizeof(svr_addr) );
+    Listen(lfd,128);
+
+
+    struct epoll_event tEp, tEpRes[OPEN_MAX];
+    efd = epoll_create(OPEN_MAX);//efd是一个fd,底层是红黑树
+    if(efd == -1){
+        sys_err("create epoll err");
+    }
+
+    tEp.events = EPOLLIN|EPOLLET;
+    tEp.data.fd = lfd;
+    int res = epoll_ctl(efd, EPOLL_CTL_ADD, lfd, &tEp );//把lfd挂在efd上.
+    if(res == -1){
+        sys_err("epoll ctrl err");
+    }
+
+    int socketfd;
+    int nready;
+    int maxfd = lfd;
+    char buf[4069];
+    int i, j;
+    struct sockaddr_in cli_addr;
+    socklen_t cli_addr_size = sizeof(cli_addr);
+    char* str;
+    int n;
+    while(1){
+        nready = epoll_wait(efd, tEpRes, OPEN_MAX, -1);
+        if(nready == -1){
+            sys_err("epoll_wait err");
+        }
+
+        for(i = 0; i < nready; i++){
+            if(!(tEpRes[i].events & EPOLLIN)){
+                continue;
+            }
+            if(tEpRes[i].data.fd == lfd){
+
+                printf("listen cli succ.now accept\n");
+                cfd = Accept(lfd, (struct sockaddr *)&cli_addr, &cli_addr_size);
+                if(argc == 3){
+                    int bufsize = atoi(argv[2]);
+                    socklen_t optlen = sizeof(bufsize);
+                    if((setsockopt(cfd, SOL_SOCKET, SO_RCVBUF,&bufsize,optlen))<0)
+                    {
+                        sys_err("set socket len err");
+                    }
+                    int nowbufsize = -1;
+                    socklen_t nowoptlen = sizeof(bufsize);
+                    if((getsockopt(cfd, SOL_SOCKET, SO_RCVBUF,&nowbufsize,&nowoptlen))<0)
+                    {
+                        sys_err("set socket len err");
+                    }
+                    printf("now sock leng=%d\n", nowbufsize);
+
+
+                }
+                printf("accept cli succ.fd = %d ip=%s port=%d\n",
+                       cfd, inet_ntop(AF_INET, &cli_addr.sin_addr, str, sizeof(str)), ntohs(cli_addr.sin_port));
+                tEp.events = EPOLLIN|EPOLLET;
+                tEp.data.fd = cfd;
+                res = epoll_ctl(efd, EPOLL_CTL_ADD, cfd, &tEp);
+                if(res == -1){
+                    sys_err("epoll ctrl err");
+                }
+            }
+            else{
+                socketfd = tEpRes[i].data.fd;
+                /* n = Read(tEpRes[i].data.fd,buf,sizeof(buf)); */
+                n = Read(tEpRes[i].data.fd,buf,5);
+                if(n == 0){
+                    printf("cfd %d gg\n",cfd);
+                    Close(tEpRes[i].data.fd);
+                    res = epoll_ctl(efd, EPOLL_CTL_DEL, socketfd, NULL);
+                    if(res == -1){
+                        sys_err("epoll del err");
+                    }
+                    printf("cfd %d gg\n", socketfd);
+                }
+                else if(n == -1){
+                    sys_err("read err");
+                }
+                else {
+                    printf("read fd=%d buf = %d|buf=%s\n",socketfd, n,buf);
+
+                    for(j = 0; j < n; j++){
+                        buf[j] = toupper(buf[j]);
+                    }
+                    Write(socketfd,buf,n);
+                    Write(STDOUT_FILENO, buf, n);
+                }
+
+            }
+        }
+    }
+
+
+
+
+
+    Close(lfd);
+
+    return 0;
+}
+```
+cli
+
+```cpp
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <pthread.h>
+#include <sys/types.h>          /* See NOTES */
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <ctype.h>
+#include <sys/signal.h>
+#include "wrap.h"
+
+#define BUFSIZE 4096
+    int cfd;
+
+void cat_sig(int iSig){
+    if(iSig == SIGQUIT){
+        printf("catch SIGQUIT sig %d start =======\n", iSig);
+        sleep(4);
+        printf("catch SIGQUIT sig %d end ========\n", iSig);
+    }
+    if(iSig == SIGINT){
+
+        printf("catch SIGINT sig %d start =======\n", iSig);
+        shutdown(cfd,2);
+        close(cfd);
+
+        printf("catch SIGINT sig %d end ========\n", iSig);
+        exit(1);
+    }
+    else{
+
+        printf("catch sig %d\n", iSig);
+    }
+    return;
+}
+int main(int argc, char* argv[])
+{
+    struct sigaction act, oldact;
+    act.sa_handler = cat_sig;
+    sigemptyset(&(act.sa_mask));
+    act.sa_flags = 0;
+
+    int ret = sigaction(SIGINT, &act, &oldact);
+    if(ret == -1){
+        sys_err("sigaction err");
+    }
+
+    cfd = socket(AF_INET, SOCK_STREAM, 0);
+    if(cfd==-1){
+        sys_err("socket err");
+    }
+    int opt  = 1;
+    setsockopt(cfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    struct sockaddr_in t_addr;
+    struct sockaddr_in t_svr;
+    t_svr.sin_family = AF_INET;
+    t_svr.sin_port = htons(9999);
+    t_svr.sin_addr.s_addr = htonl(INADDR_ANY);
+    socklen_t t_svr_size = sizeof(t_svr);
+
+    socklen_t *t_cli_size;
+    t_cli_size = (socklen_t * )malloc(sizeof(socklen_t));
+    *t_cli_size = sizeof(struct sockaddr_in);
+
+    t_addr.sin_family= AF_INET;
+    if(argc >= 2)
+    {
+        int port = atoi(argv[1]);
+        bzero(&t_addr, sizeof(t_addr));
+        t_addr.sin_family = AF_INET;
+        printf("====svr:port=%d======\n", port);
+        t_addr.sin_port = htons(port);
+        t_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+        Bind(cfd,(struct sockaddr *)&t_addr, sizeof(t_addr) );
+
+    }
+    /* t_addr.sin_port = htons(9999); t_addr.sin_addr.s_addr = htonl(INADDR_ANY); */
+    ret =connect(cfd, (struct sockaddr*)&t_svr, t_svr_size);
+    if(ret == -1)
+    {
+        sys_err("socket err");
+
+    }
+    char b[4096];
+        int i  = 0;
+        int maxbuf=0;
+        if(argc == 3){
+            maxbuf = atoi(argv[2]);
+        }
+        for(i = 0;i < maxbuf; i ++)
+        {
+            b[i]='a';
+        }
+
+    while(1){
+
+        write(cfd, b,maxbuf);
+        printf("write succ. now read\n");
+        ret = read(cfd, b, sizeof(b));
+        if(ret){
+            printf("%s\n", b);
+        }
+        sleep(1);
+    }
+
+    return 0;
+}
+```
+可以看到:cli是最后不能发送到的(需要制定每次发较大的内容),从[tcpdump](../tools/tcpdump.md)看到:最后cli不停发送包,但是svr没有回包.因为svr还没处理完数据.cli最后一次填满之后,svr侧由于et后续没有触发到read动作.因此cli的cfd写阻塞.
+
+所以**ET要和忙轮询**一起处
+
+### epoll反应堆模型
+epoll ET
+非阻塞
+void *ptr
+
+留意epoll_wait:
+```cpp
+int epoll_wait(int epfd, struct epoll_event *events,
+                      int maxevents, int timeout);
+```
+epoll_event定义:
+```cpp
+           typedef union epoll_data {
+               void    *ptr;
+               int      fd;
+               uint32_t u32;
+               uint64_t u64;
+           } epoll_data_t;
+
+           struct epoll_event {
+               uint32_t     events;    /* Epoll events */
+               epoll_data_t data;      /* User data variable */
+           };
+```
+epoll_wait的返回判断data.fd.和ptr用同一块内存.
+epoll_wait有相应的时候自动回调->反应堆模式
+
+#### 普通流程vs反应堆流程
+普通流程:
+- socket 
+- bind 
+- listen 
+- epoll_create epoll_ctl(EPOLL_CTL_ADD)
+- while(1)
+    - eopll_wait
+    - fd有事件
+    - 判断监听事件数组
+        - lfd满足
+            - Accept
+            - epoll_create epoll_ctl(EPOLL_CTL_ADD, cfd)
+        - cfd满足
+            - read
+                - 读gg:epoll_ctl(EPOLL_CTL_DEL, cfd) 不监听
+            - logic
+            - write
+
+反应堆模型
+- socket 
+- bind 
+- listen 
+- epoll_create epoll_ctl(EPOLL_CTL_ADD)
+- while(1)
+    - eopll_wait
+    - fd有事件
+    - 判断监听事件数组
+        - lfd满足
+            - Accept
+            - epoll_ctl(EPOLL_CTL_ADD, cfd)
+        - cfd读满足
+            - read
+                - 读gg:epoll_ctl(EPOLL_CTL_DEL, cfd) 不监听
+            - epoll_ctl(EPOLL_CTL_DEL, cfd)
+            - epoll_ctl(EPOLL_CTL_ADD, cfd.EPOLLOUT)
+        - cfd满足写
+            - write
+            - epoll_ctl(EPOLL_CTL_DEL, cfd)
+            - epoll_ctl(EPOLL_CTL_ADD, cfd.EPOLLIN)
+
+为什么使用反应堆:
+网络环境复杂,对端可能半关闭,或者对端可能滑动窗口很小,阻塞.
+监听写事件然后再写.可读的情况下再写,有两个好处
+- 不需要写阻塞.如果对端没有及时处理数据,socket本端可能写阻塞.
+- 提高cpu效率.阻塞会大大浪费系统资源.
+
+反应堆例子
+```cpp
+#include "wrap.h"
+#include <unistd.h>
+#include <sys/epoll.h>
+#include <fcntl.h>
+#include "react.h"
+
+#define OPEN_MAX 5000
+
+#define BUFLEN 4096
+#define MAX_EVENTS 5000
+#define SVR_PORT 9999
+
+struct myevent_s{
+    int fd;
+    int events;
+    void *arg;
+    void (*call_back)(int fd, int events, void* arg);
+    int status;//是否在红黑树上
+    char buf[BUFLEN];
+    int len;
+    long last_active;//加入红黑树时间 过期之后从红黑树拿掉
+};
+
+int g_efd;
+struct myevent_s g_events[MAX_EVENTS + 1];//for lfd
+struct epoll_event events[MAX_EVENTS + 1];
+
+//events表示epoll关心的EPOLLIN EPOLLOUT
+void eventadd(int efd, int events, struct myevent_s* myEv){
+    struct epoll_event epv = {0,{0}};
+    int op = 0;
+    epv.data.ptr = myEv;
+    epv.events = myEv->events = events;
+
+    if(myEv->status == 0){
+        op= EPOLL_CTL_ADD;
+        myEv->status = 1;
+    }
+
+    if(epoll_ctl(efd, op, myEv->fd, &epv) < 0){
+        printf("event add fail [fd=%d],events[%d]\n", myEv->fd, events);
+    }
+    else{
+        printf("myEvnet add succ [fd=%d], op=%d, events[%0X]\n",myEv->fd,op, events);
+    }
+    return;
+}
+
+
+void eventset(struct myevent_s *ev, int fd, void(*call_back)(int, int, void*), void *arg){
+    ev->fd = fd;
+    ev->call_back = call_back;
+    ev->events = 0;
+    ev->arg = arg;
+    ev->status = 0;
+    if(ev->len == 0){
+        bzero(ev->buf, sizeof(ev->buf));
+    }
+    /* bzero(ev->buf, sizeof(ev->buf)); */
+    /* ev->len = 0; */
+    ev->last_active = time(NULL);
+    return;
+}
+void eventdel(int efd, struct myevent_s *myEv){
+    struct epoll_event epv = {0,{0}};
+    if(myEv->status != 1){
+        return;
+    }
+    myEv->status = 0;
+
+    epv.data.ptr = NULL;
+    epoll_ctl(efd, EPOLL_CTL_DEL, myEv->fd , &epv);
+    printf("fd %d is removed in epoll list\n",myEv->fd);
+    return;
+}
+
+void senddata(int fd, int events, void *arg){
+    struct myevent_s *myEv = (struct myevent_s*) arg;
+    int len;
+    printf("[line:%d] before send data.fd=%d, buf=%s, sizeof(buf)=%d\n",
+           __LINE__,fd, myEv->buf, myEv->len);
+    len = send(fd, myEv->buf, myEv->len ,0);
+    eventdel(g_efd, myEv);
+    if(len > 0){
+        printf("send fd=%d len=%lu, buf=%s",myEv->fd ,sizeof(myEv->buf ), myEv->buf );
+        eventset(myEv, fd, rcvddata,myEv);
+        eventadd(g_efd, EPOLLIN, myEv);
+    }
+    else{
+        close(myEv->fd );
+        printf("send fd=%d err. err=%s\n", fd,strerror(errno));
+    }
+    return;
+}
+
+void rcvddata(int fd, int events, void *arg){
+    struct myevent_s *myEv = (struct myevent_s *)arg;
+    int len;
+    printf("ready to read. cfd = %d\n",fd);
+    len = recv(fd, myEv->buf, sizeof(myEv->buf),0);
+
+    eventdel(g_efd, myEv);
+
+    if(len > 0){
+        myEv->len = len;
+        myEv->buf[len] = '\0';
+        printf("[line:%d] fd=%d read data size=%d:%s\n",__LINE__, myEv->len, fd, myEv->buf);
+
+        eventset(myEv, fd, senddata, myEv);
+        eventadd(g_efd, EPOLLOUT, myEv);
+    }
+    else if(len == 0){
+        close(myEv->fd);
+        printf("fd:%d pos:%ld closed\n",fd, myEv - g_events);
+    }
+    else{
+        close(myEv->fd);
+        printf("recv fd:%d errno:%d  err:%s\n",fd, errno, strerror(errno));
+    }
+
+}
+
+void acceptconn(int lfd, int events, void *arg){
+    struct sockaddr_in cin;
+    socklen_t len =  sizeof(cin);
+    int cfd, i;
+    if((cfd= accept(lfd, (struct sockaddr*)&cin, &len)) == -1){
+        if(errno != EAGAIN && errno != EINTR){
+
+        }
+        sys_err("accept err");
+    }
+
+    do{
+        for(i = 0; i < MAX_EVENTS; i++){
+            if(g_events[i].status == 0){
+                break;
+            }
+        }
+
+        if(i == MAX_EVENTS){
+            printf("%s:max conn limit[%d]\n",__func__, MAX_EVENTS);
+            break;
+        }
+
+        int flag = 0;
+        if((flag = fcntl(cfd, F_SETFL, O_NONBLOCK)) < 0){
+            printf("%s: fcntl nonblocking fail,%s\n",__func__, strerror(errno));
+        }
+
+        printf("event list %d added.fd=%d\n",i,cfd);
+        eventset(&g_events[i], cfd, rcvddata, &g_events[i]);
+        eventadd(g_efd, EPOLLIN, &g_events[i]);
+    }while(0);
+    printf("new connect [%s:%d][time:%ld],pos[%d]\n",
+           inet_ntoa(cin.sin_addr), ntohs(cin.sin_port), g_events[i].last_active,i);
+    return;
+}
+
+
+
+
+void initSocketListen(int efd, unsigned short port){
+
+    int lfd = Socket(AF_INET, SOCK_STREAM, 0);
+    fcntl(lfd, F_SETFL, O_NONBLOCK);
+
+
+    int opt  = 1;
+    setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in svr_addr;
+    /* memset(&svr_addr, 0, sizeof(svr_addr)); */
+    bzero(&svr_addr, sizeof(svr_addr));//初始化socket
+
+    svr_addr.sin_family = AF_INET;
+    svr_addr.sin_port = htons(port);//根据port 转为网络字节序
+    /* svr_addr.sin_addr.s_addr = htonl(INADDR_ANY);//使用本机地址 */
+    svr_addr.sin_addr.s_addr = htonl(INADDR_ANY);//使用本机地址
+
+    Bind(lfd,(struct sockaddr *)&svr_addr, sizeof(svr_addr) );
+    Listen(lfd,128);
+
+    eventset(&g_events[MAX_EVENTS], lfd, acceptconn, &g_events[MAX_EVENTS]);
+    eventadd(efd, EPOLLIN, &g_events[MAX_EVENTS]);
+
+    printf("===lfd added on epoll.svr:port=%d======\n", port);
+    return;
+}
+
+
+int main(int argc, char* argv[])
+{
+    unsigned short port = SVR_PORT;
+    if(argc == 2){
+        port = atoi(argv[1]);
+    }
+
+    g_efd = epoll_create(MAX_EVENTS + 1);
+    if(g_efd <=0){
+        sys_err("epoll_create err");
+    }
+
+    initSocketListen(g_efd,port);
+
+    int checkpos = 0, i;
+    while(1){
+        long lNow = time(NULL);
+        for(i = 0; i < 100; i++, checkpos ++){
+            if(checkpos == MAX_EVENTS){
+                checkpos = 0;
+            }
+            if(g_events[checkpos].status != 1){
+                continue;//事件列表不在红黑树上
+            }
+            long lDuration = lNow - g_events[checkpos].last_active;
+            if(lDuration >= 60){
+                Close(g_events[checkpos].fd);
+                printf("===fd %d gg====\n", g_events[checkpos].fd);
+                eventdel(g_efd, &g_events[checkpos]);
+            }
+        }
+
+        int nfd = epoll_wait(g_efd, events, MAX_EVENTS+1,1000);
+        if(nfd < 0){
+            sys_err("epoll wait err");
+        }
+
+        for(i = 0; i < nfd;i++){
+            struct myevent_s *ev = (struct myevent_s*)events[i].data.ptr;
+            if((events[i].events & EPOLLIN) && (ev->events & EPOLLIN)){
+                ev->call_back(ev->fd, events[i].events, ev->arg);
+
+            }
+            if((events[i].events & EPOLLOUT) && (ev->events & EPOLLOUT)){
+                ev->call_back(ev->fd, events[i].events, ev->arg);
+            }
+        }
+
+
+    }
+
+    return 0;
+}
+```
+
+
