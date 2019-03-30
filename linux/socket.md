@@ -892,3 +892,24 @@ errno是EINTR是被中断,被系统中断.是应该再等下的
 errno是**ECONNRESET**表示当前连接被重置,很可能是在accept的时候对端没有回包ack,内核会重置.
 errno是其他情况才要gg
 
+ 
+## unix socket
+int socket(int domain, int type, int protocol) 
+domain:AF_UNIX/AF_LOCAL
+type: SOCK_STREAM或者SOCK_DGRAM
+
+地址结构:
+sockaddr_un 
+addr.sun_family=AF_UNIX 因为这里不是inet类型,是unix类型. 
+strcpy(addr.sunpath,"实际路径")
+len = offsetof(struct sockaddr_un, sun_path)+strlen("路径名")
+bind(fd, (struct sockaddr*)&(addr, len));
+**注意**:bind成功会创建一个socket.为了bind成功,在bind之前unlink. unlink("路径名")防止路径出现问题,之前被占用等原因导致不能bind.
+
+cli和svr的socket是伪文件,不占用磁盘空间
+通过bind创建. bind成功会创建伪文件.所以对应路径之前不要有同名的文件.否则bind失败.
+
+accept的时候可以拿到客户端的socket addr,对应的应该是客户端的addr设定的path
+
+cli和svr的文件名不是同一个.
+cli不能隐式绑定
