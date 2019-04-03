@@ -744,6 +744,481 @@ v = (((v | m0) + 1) & ~m0) | (v & m0);
 ```
 
 
+### dict有_dictRehashStep的操作
+- dictAddRaw
+- dictGenericDelete
+- dictFind
+- dictGetRandomKey
+
+### 迭代器和scan区别
+
+|特点|迭代器|scan|
+|---|---|---|
+|单位|entry|table i|
+|遍历顺序|table++,nextEntry|table编号后缀二进制倒叙|
+|能不能保证完全遍历|不能.比如缩容|能|
+
+# ziplist 
+跳表结构  
+```cpp
+typedef struct zskiplist {
+
+    // 表头节点和表尾节点
+    struct zskiplistNode *header, *tail;
+
+    // 表中节点的数量
+    unsigned long length;
+
+    // 表中层数最大的节点的层数
+    int level;
+
+} zskiplist;
+```
+头尾节点,数量,最大层数
+
+跳表节点
+```cpp
+typedef struct zskiplistNode {
+
+    // 成员对象
+    robj *obj;
+
+    // 分值
+    double score;
+
+    // 后退指针
+    struct zskiplistNode *backward;
+
+    // 层
+    struct zskiplistLevel {
+
+        // 前进指针
+        struct zskiplistNode *forward;
+
+        // 跨度
+        unsigned int span;
+
+    } level[];
+
+} zskiplistNode;
+```
+成员,分值,这个节点的后退指.层包括层的前进指针以及这个前进指针对应的跨度. 
+注意:层是结构体数组.本质是一个指向这个结构体的指针.  
+头结点不记录数据,但是有每一层的层高,span,方便查找.
+
+## zskiplistNode *zslInsert(zskiplist *zsl, double score, robj *obj) 
+
+跳表插入.根据分数插入,返回新节点的地址.  
+ZSKIPLIST_MAXLEVEL是跳表级数的最大上限,32.
+插入之前先找到插入的路径.  
+- 新建unsigned int rank[ZSKIPLIST_MAXLEVEL],用来记录跨度
+- zskiplistNode * update[ZSKIPLIST_MAXLEVEL], * x,用来记录当前更新到哪个节点(就是搜索路经)
+- 从头节点开始往下搜,头结点会记录最大的level.而rank[i]从zsl.level-1开始往下搜.最顶开始初始化是0,后续的初始化是上一个,就是rank[i+1]
+		- 如果当前节点的level[i]有forward,而且需要插入的score比节点的score要大,或者有forward且插入的obj比节点的obj要大,rank[i] += x->level[i].span;x = x->level[i].forward;
+        - 上述流程继续找,直到找到比要插入节点的要大的
+        - 此时终止在刚好比自己小的节点上.这里rank[i]记录了从头节点到现在移动的跨度.记录下当时的x.update[i] = x
+经过上面的跳转,可以理解成:从最高的level的节点开始找,找到刚好比自己大的,记录下这个跳表节点.如果这个节点已经没有forward,跳出来找下一级.  
+这时候拿到了rank[],表示搜索的时候在当前的level跳转了多少距离到下一个符合条件的跳表节点.  
+update[]表示的是每次每一级应该在哪个节点插入.
+```cpp
+    unsigned int rank[ZSKIPLIST_MAXLEVEL];
+    int i, level;
+
+    redisAssert(!isnan(score));
+
+    // 在各个层查找节点的插入位置
+    // T_wrost = O(N^2), T_avg = O(N log N)
+    x = zsl->header;
+    for (i = zsl->level-1; i >= 0; i--) {
+
+        /* store rank that is crossed to reach the insert position */
+        // 如果 i 不是 zsl->level-1 层
+        // 那么 i 层的起始 rank 值为 i+1 层的 rank 值
+        // 各个层的 rank 值一层层累积
+        // 最终 rank[0] 的值加一就是新节点的前置节点的排位
+        // rank[0] 会在后面成为计算 span 值和 rank 值的基础
+        rank[i] = i == (zsl->level-1) ? 0 : rank[i+1];
+
+        // 沿着前进指针遍历跳跃表
+        // T_wrost = O(N^2), T_avg = O(N log N)
+        while (x->level[i].forward &&
+            (x->level[i].forward->score < score ||
+                // 比对分值
+                (x->level[i].forward->score == score &&
+                // 比对成员， T = O(N)
+                compareStringObjects(x->level[i].forward->obj,obj) < 0))
+                ) {
+
+            // 记录沿途跨越了多少个节点
+            rank[i] += x->level[i].span;
+
+            // 移动至下一指针
+            x = x->level[i].forward;
+        }
+        // 记录将要和新节点相连接的节点
+        update[i] = x;
+    }
+```
+经过上面的跳转,可以拿到一条**搜索路径**.
+![](../imgs/redis/skiplist_search.png)
+概括来说就是从上到下开始,每次找到当前level适合插入的节点,然后降级,从上次的节点开始继续向下找.同时记录路径.  
+
+下一步是通过连续枚举随机数,这个随机数用来确定当前这个跳表节点的level
+```cpp
+int zslRandomLevel(void) {
+    int level = 1;
+
+    while ((random()&0xFFFF) < (ZSKIPLIST_P * 0xFFFF))
+        level += 1;
+
+    return (level<ZSKIPLIST_MAXLEVEL) ? level : ZSKIPLIST_MAXLEVEL;
+}
+```
+ZSKIPLIST_P是0.25,意味着在大概率里高一级的个数是低一级的1/4.  
+节点的级数是通过概率来确定的,也就是会有极小的情况会拿到一个很高的level(当枚举足够大的时候才出现,是合理的.因为这时候已经有足够多的小level节点)  
+
+如果高于当前zsl的level,高于level的需要进行初始化
+```cpp
+    if (level > zsl->level) {
+
+        // 初始化未使用层
+        // T = O(1)
+        for (i = zsl->level; i < level; i++) {
+            rank[i] = 0;
+            update[i] = zsl->header;
+            update[i]->level[i].span = zsl->length;
+        }
+
+        // 更新表中节点最大层数
+        zsl->level = level;
+    }
+```
+可以理解是:update[]这里高于level的都相当于从头节点开始找,这个level的span(就是到即将插入的节点)就是zsl的length(因为这个节点一定会放到最后面)
+
+有了level和搜索路径,可以创建节点,然后把节点插入到跳表中.  
+因为之前的update[i]就是刚好比即将插入节点要小的节点,所以节点的level[i]就是update[i]的level[i]的forward,就是刚好比自己小的节点的后驱  
+update[i]的forward就是x(因为x插在后面)  
+x的跨度update[i]->level[i].span - (rank[0] - rank[i]),因为已经比update[i]往后了(rank[0] - rank[i])这里rank[0]可以理解就是插入的排序.  
+update[i].span也需要更改,因为已经不是之前的span,而是比之前span更往前.rank[i]就是当前update[i]的位置,所以直接是(rank[0] - rank[i]) + 1
+```cpp
+    for (i = 0; i < level; i++) {
+        
+        // 设置新节点的 forward 指针
+        x->level[i].forward = update[i]->level[i].forward;
+        
+        // 将沿途记录的各个节点的 forward 指针指向新节点
+        update[i]->level[i].forward = x;
+
+        /* update span covered by update[i] as x is inserted here */
+        // 计算新节点跨越的节点数量
+        x->level[i].span = update[i]->level[i].span - (rank[0] - rank[i]);
+
+        // 更新新节点插入之后，沿途节点的 span 值
+        // 其中的 +1 计算的是新节点
+        update[i]->level[i].span = (rank[0] - rank[i]) + 1;
+    }
+```
+如果插入的节点level比原来的要高,span++(因为之前还没插入,现在节点插入了)    
+最后设置x的backward指针,就是update[0],以及zsl的长度++  
+
+插入前
+```ditaa
+┌─────────────┐                                                                                                                                                           
+│     zsl     │          ┌──────────────┐                                                                                                                                 
+├─────────────┤          │     ...      │                                                                                                                                 
+│   header    │          ├──────────────┤                                                                                                                                 
+│             │─────────▶│      L4      │                                                                                                                                 
+├─────────────┤          ├──────────────┤                                                                                                                                 
+│    tail     │          │      L3      │                                                                                                                                 
+│             │          ├──────────────┤                                                                                                                                 
+├─────────────┤          │      L2      │                                                                                                                                 
+│    level    │          ├──────────────┤                                                                      ┌──────────────┐                                           
+│             │          │      L1      │──────────────────────────────────────────────2──────────────────────▶│      L1      │                                           
+├─────────────┤          ├──────────────┤                 ┌──────────────┐            ┌──────────────┐         ├──────────────┤          ┌──────────────┐                 
+│   length    │          │      L0      │─────1──────────▶│      L0      │────1──────▶│      L0      │───1────▶│      L0      │───1─────▶│      L0      │────────────────▶
+│             │          └──────────────┘                 ├──────────────┤            ├──────────────┤         ├──────────────┤          ├──────────────┤                 
+├─────────────┤                                     ┌─────│   backward   │            │   backward   │         │   backward   │          │   backward   │                 
+│             │                                     │     ├──────────────┤            ├──────────────┤         ├──────────────┤          ├──────────────┤                 
+│             │                                     │     │    score     │            │    score     │         │    score     │          │    score     │                 
+│             │                                ◀────┘     ├──────────────┤            ├──────────────┤         ├──────────────┤          ├──────────────┤                 
+│             │                                           │     obj      │            │     obj      │         │     obj      │          │     obj      │                 
+│             │                                           └──────────────┘            └──────────────┘         └──────────────┘          └──────────────┘                 
+└─────────────┘                                                                                                                                                                                                                                                                                                                   
+```
+
+找到路径
+```ditaa
+┌─────────────┐                                                                                                                                                                                    
+│     zsl     │          ┌──────────────┐                                                                                                                                                          
+├─────────────┤          │     ...      │                                                                                                                                                          
+│   header    │          ├──────────────┤                                                                                                                                                          
+│             │─────────▶│      L4      │                                                                                                                                                          
+├─────────────┤          ├──────────────┤                                                                                                                                                          
+│    tail     │          │      L3      │                                                                                                                                                          
+│             │          ├──────────────┤                                                                                                                                                          
+├─────────────┤          │      L2      │                                                                                                                                                          
+│    level    │          ├──────────────┤                                                                      ┌──────────────┐                                                                    
+│             │          │      L1      │──────────────────────────────────────────────2──────────────────────▶│      L1      │───────────────▶                                                    
+├─────────────┤          ├──────────────┤                 ┌──────────────┐            ┌──────────────┐         ├──────────────┤               ┌──────────────┐                                     
+│   length    │          │      L0      │─────1──────────▶│      L0      │────1──────▶│      L0      │───1────▶│      L0      │─────1────────▶│      L0      │────────────────────────────▶        
+│             │          └──────────────┘                 ├──────────────┤            ├──────────────┤         ├──────────────┤               ├──────────────┤                                     
+├─────────────┤                                     ┌─────│   backward   │            │   backward   │         │   backward   │               │   backward   │                                     
+│             │                                     │     ├──────────────┤            ├──────────────┤         ├──────────────┤               ├──────────────┤                                     
+│             │                                     │     │    score     │            │    score     │         │    score     │               │    score     │                                     
+│             │                                ◀────┘     ├──────────────┤            ├──────────────┤         ├──────────────┤               ├──────────────┤                                     
+│             │                                           │     obj      │            │     obj      │         │     obj      │               │     obj      │                                     
+│             │                                           └──────────────┘            └──────────────┘         └──────────────┘               └──────────────┘                                     
+└─────────────┘                                                                                                        ▲                              ▲                                            
+                                                                                                                       │                              │                            ┌──────────────┐
+                                                                                                                       │                              │                            │   new node   │
+                                                                                                                       │                              │                            ├──────────────┤
+                                                                                                                       │                              │                            │      L0      │
+                                                                                                                       │                              │                            ├──────────────┤
+                                                                                                                       │                              │                            │   backward   │
+                                                                                                                       │                              │                            ├──────────────┤
+                                                                                                                       │                              │                            │    score     │
+                                                                                                                       │                              │                            ├──────────────┤
+                                                                                                                       │         ┌────────┐           │         ┌────────┐         │     obj      │
+                                                                                                                       │         │ update │           │         │  rank  │         └──────────────┘
+                                                                                                                       │         ├────────┤           │         ├────────┤                         
+                                                                                                                       └─────────│   1    │           │         │   3    │                         
+                                                                                                                                 ├────────┤           │         ├────────┤                         
+                                                                                                                                 │   0    │───────────┘         │   4    │                         
+                                                                                                                                 └────────┘                     └────────┘                         
+                                                                                                                                
+```
+
+插入后
+```ditaa
+┌─────────────┐                                                                                                                                                                                          
+│     zsl     │          ┌──────────────┐                                                                                                                                                                
+├─────────────┤          │     ...      │                                                                                                                                                                
+│   header    │          ├──────────────┤                                                                                                                                                                
+│             │─────────▶│      L4      │                                                                                                                                                                
+├─────────────┤          ├──────────────┤                                                                                                                                                                
+│    tail     │          │      L3      │                                                                                                                                                                
+│             │          ├──────────────┤                                                                                                                                                                
+├─────────────┤          │      L2      │                                                                                                                                                                
+│    level    │          ├──────────────┤                                                                      ┌──────────────┐                                               ┌──────────────┐           
+│             │          │      L1      │──────────────────────────────────────────────2──────────────────────▶│      L1      │───────────────▶                               │   new node   │           
+├─────────────┤          ├──────────────┤                 ┌──────────────┐            ┌──────────────┐         ├──────────────┤               ┌──────────────┐                ├──────────────┤           
+│   length    │          │      L0      │─────1──────────▶│      L0      │────1──────▶│      L0      │───1────▶│      L0      │─────1────────▶│      L0      │───────1───────▶│      L0      │──────────▶
+│             │          └──────────────┘                 ├──────────────┤            ├──────────────┤         ├──────────────┤               ├──────────────┤                ├──────────────┤           
+├─────────────┤                                     ┌─────│   backward   │◀───────────│   backward   │◀────────│   backward   │◀──────────────│   backward   │◀───────────────│   backward   │           
+│             │                                     │     ├──────────────┤            ├──────────────┤         ├──────────────┤               ├──────────────┤                ├──────────────┤           
+│             │                                     │     │    score     │            │    score     │         │    score     │               │    score     │                │    score     │           
+│             │                                ◀────┘     ├──────────────┤            ├──────────────┤         ├──────────────┤               ├──────────────┤                ├──────────────┤           
+│             │                                           │     obj      │            │     obj      │         │     obj      │               │     obj      │                │     obj      │           
+│             │                                           └──────────────┘            └──────────────┘         └──────────────┘               └──────────────┘                └──────────────┘           
+└─────────────┘                                                                                                        ▲                              ▲                                                  
+                                                                                                                       │                              │                                                  
+                                                                                                                       │                              │                                                  
+                                                                                                                       │                              │                                                  
+                                                                                                                       │                              │                                                  
+                                                                                                                       │                              │                                                  
+                                                                                                                       │                              │                                                  
+                                                                                                                       │                              │                                                  
+                                                                                                                       │                              │                                                  
+                                                                                                                       │                              │                                                  
+                                                                                                                       │         ┌────────┐           │         ┌────────┐                               
+                                                                                                                       │         │ update │           │         │  rank  │                               
+                                                                                                                       │         ├────────┤           │         ├────────┤                               
+                                                                                                                       └─────────│   1    │           │         │   3    │                               
+                                                                                                                                 ├────────┤           │         ├────────┤                               
+                                                                                                                                 │   0    │───────────┘         │   4    │                               
+                                                                                                                                 └────────┘                     └────────┘                               
+
+
+```
+
+### void zslDeleteNode(zskiplist *zsl, zskiplistNode *x, zskiplistNode **update)
+和插入类似,使用update数组记录搜索路径,对每一个刚好比x小的节点都释放掉x(指针不指向x,而是指向x.forward.而且span+=x.level[i].span - 1,补全了和删除后的forward的距离)
+
+其次:level[0].forward更改,forward的backward更改,以及zsl的length --
+
+如果这个节点是最高的节点,zsl的level调整.  
+如果这个节点是尾部,zsl.tail调整.
+
+# intset
+```cpp
+typedef struct intset {
+    
+    // 编码方式
+    uint32_t encoding;
+
+    // 集合包含的元素数量
+    uint32_t length;
+
+    // 保存元素的数组
+    int8_t contents[];
+
+} intset;
+
+```
+搜索:二分查找(因为底层有序)
+
+### 插入
+intset在插入的时候会判断新插入的元素判断是否升级格式,如果是,需要升级insert格式.  
+每次都需要insert resize,因为inset长度需要改变.
+需要调整的位置使用把整块内存往后移动  
+
+如果需要调整空间(要么插入的数比所有的数都大,要么是负数)
+- 申请足够的空间 zrealloc
+- _intsetSet让每个元素放到适合的地方(避开新插入的元素)
+- 插入新元素
+
+如果当前的编码是适合的,直接插入
+- 找出插入元素的位置,使用二分法
+- memmove符合位置后面的数据
+- 元素放入合适的位置
+
+### 删除
+找出对应删除的位置,后续数组memmove到要删除的位置(覆盖原来数据),然后zrealloc(size-1)
+
+
+# ziplist 压缩列表
+结构
+```
+<zlbytes><zltail><zllen><entry><entry><zlend>
+```
+- <zlbytes> 是一个无符号整数，保存着 ziplist 使用的内存数量。为了不需要遍历整个ziplist而记录.
+- <zltail> 保存着到达列表中最后一个节点的偏移量。 这样使得pop不需要遍历都可以实现.O(1)
+- <zllen> 保存着列表中的节点数量。 但是当zllen > 2**16-2 要遍历才知道实际多少节点.
+- <zlend> 的长度为 1 字节，值为 255 ，标识列表的末尾
+- <entry> 格式是<header><body> <header>记录两个信息:
+    - 前置节点的长度,用于向前遍历.
+        - 如果前置节点长度 < 254,使用一个字节保存(2^8).
+        - 否则使用5个字节保存:第一个字节是254表示是一个5字节长度的长度值.后面4个字节保存实际长度.
+    - 当前节点的类型和长度.不同类型会有不同的格式
+        - 字符串类型,如果长度足够小,信息直接放在头中
+        - 整形都放在body中
+        - 如果是11111111,表示是zpilist的结尾.
+
+```
+ * 1) 如果节点保存的是字符串值，
+ *    那么这部分 header 的头 2 个位将保存编码字符串长度所使用的类型，
+ *    而之后跟着的内容则是字符串的实际长度。
+ *
+ * |00pppppp| - 1 byte
+ *      String value with length less than or equal to 63 bytes (6 bits).
+ *      字符串的长度小于或等于 63 字节。
+ * |01pppppp|qqqqqqqq| - 2 bytes
+ *      String value with length less than or equal to 16383 bytes (14 bits).
+ *      字符串的长度小于或等于 16383 字节。
+ * |10______|qqqqqqqq|rrrrrrrr|ssssssss|tttttttt| - 5 bytes
+ *      String value with length greater than or equal to 16384 bytes.
+ *      字符串的长度大于或等于 16384 字节。
+ *
+ * 2) 如果节点保存的是整数值，
+ *    那么这部分 header 的头 2 位都将被设置为 1 ，
+ *    而之后跟着的 2 位则用于标识节点所保存的整数的类型。
+ *
+ * |11000000| - 1 byte
+ *      Integer encoded as int16_t (2 bytes).
+ *      节点的值为 int16_t 类型的整数，长度为 2 字节。
+ * |11010000| - 1 byte
+ *      Integer encoded as int32_t (4 bytes).
+ *      节点的值为 int32_t 类型的整数，长度为 4 字节。
+ * |11100000| - 1 byte
+ *      Integer encoded as int64_t (8 bytes).
+ *      节点的值为 int64_t 类型的整数，长度为 8 字节。
+ * |11110000| - 1 byte
+ *      Integer encoded as 24 bit signed (3 bytes).
+ *      节点的值为 24 位（3 字节）长的整数。
+ * |11111110| - 1 byte
+ *      Integer encoded as 8 bit signed (1 byte).
+ *      节点的值为 8 位（1 字节）长的整数。
+ * |1111xxxx| - (with xxxx between 0000 and 1101) immediate 4 bit integer.
+ *      Unsigned integer from 0 to 12. The encoded value is actually from
+ *      1 to 13 because 0000 and 1111 can not be used, so 1 should be
+ *      subtracted from the encoded 4 bit value to obtain the right value.
+ *      节点的值为介于 0 至 12 之间的无符号整数。
+ *      因为 0000 和 1111 都不能使用，所以位的实际值将是 1 至 13 。
+ *      程序在取得这 4 个位的值之后，还需要减去 1 ，才能计算出正确的值。
+ *      比如说，如果位的值为 0001 = 1 ，那么程序返回的值将是 1 - 1 = 0 。
+ * |11111111| - End of ziplist.
+ *      ziplist 的结尾标识
+ *
+ * All the integers are represented in little endian byte order.
+ *
+ * 所有整数都表示为小端字节序。
+ ```
+
+ ziplist格式
+ ```cpp
+ /* 
+空白 ziplist 示例图
+
+area        |<---- ziplist header ---->|<-- end -->|
+
+size          4 bytes   4 bytes 2 bytes  1 byte
+            +---------+--------+-------+-----------+
+component   | zlbytes | zltail | zllen | zlend     |
+            |         |        |       |           |
+value       |  1011   |  1010  |   0   | 1111 1111 |
+            +---------+--------+-------+-----------+
+                                       ^
+                                       |
+                               ZIPLIST_ENTRY_HEAD
+                                       &
+address                        ZIPLIST_ENTRY_TAIL
+                                       &
+                               ZIPLIST_ENTRY_END
+
+非空 ziplist 示例图
+
+area        |<---- ziplist header ---->|<----------- entries ------------->|<-end->|
+
+size          4 bytes  4 bytes  2 bytes    ?        ?        ?        ?     1 byte
+            +---------+--------+-------+--------+--------+--------+--------+-------+
+component   | zlbytes | zltail | zllen | entry1 | entry2 |  ...   | entryN | zlend |
+            +---------+--------+-------+--------+--------+--------+--------+-------+
+                                       ^                          ^        ^
+address                                |                          |        |
+                                ZIPLIST_ENTRY_HEAD                |   ZIPLIST_ENTRY_END
+                                                                  |
+                                                        ZIPLIST_ENTRY_TAIL
+*/
+```
+zltail是从ztail开始到zlend之前这段内存偏移的大小. 空白图例中的ztail+zllen  
+zlbytes是从zlbytes开始到zlend最后这段内存的偏移. 空白图例中的zlbytes+zltail+zllen+zlend
+
+zlentry结构
+```cpp
+/*
+ * 保存 ziplist 节点信息的结构
+ */
+typedef struct zlentry {
+
+    // prevrawlen ：前置节点的长度
+    // prevrawlensize ：编码 prevrawlen 所需的字节大小
+    unsigned int prevrawlensize, prevrawlen;
+
+    // len ：当前节点值的长度
+    // lensize ：编码 len 所需的字节大小
+    unsigned int lensize, len;
+
+    // 当前节点 header 的大小
+    // 等于 prevrawlensize + lensize
+    unsigned int headersize;
+
+    // 当前节点值所使用的编码类型
+    unsigned char encoding;
+
+    // 指向当前节点的指针
+    unsigned char *p;
+
+} zlentry;
+```
+
+### __ziplistCascadeUpdate
+
+
+
+
+
+
+
 
 
 
