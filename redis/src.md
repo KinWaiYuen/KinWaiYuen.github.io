@@ -745,10 +745,15 @@ v = (((v | m0) + 1) & ~m0) | (v & m0);
 
 
 ### dict有_dictRehashStep的操作
+**重点注意**
+所谓的渐进式rehash.增删改查都会有触发到
 - dictAddRaw
 - dictGenericDelete
 - dictFind
 - dictGetRandomKey
+- dictAdd
+- dictReplace
+- dictReplaceRaw
 
 ### 迭代器和scan区别
 
@@ -1221,6 +1226,1081 @@ typedef struct zlentry {
 
 
 # 对象
+对象结构
+```cpp
+typedef struct redisObject {
+
+    // 类型
+    unsigned type:4;
+
+    // 编码
+    unsigned encoding:4;
+
+    // 对象最后一次被访问的时间
+    unsigned lru:REDIS_LRU_BITS; /* lru time (relative to server.lruclock) */
+
+    // 引用计数
+    int refcount;
+
+    // 指向实际值的指针
+    void *ptr;
+
+} robj;
+```
+其中lru是REDIS_LRU_BITS,24.  
+对象被创建的时候  
+```cpp
+robj *createObject(int type, void *ptr) {
+
+    robj *o = zmalloc(sizeof(*o));
+
+    o->type = type; //类型
+    o->encoding = REDIS_ENCODING_RAW;  //编码规则
+    o->ptr = ptr; //数据
+    o->refcount = 1;
+
+    /* Set the LRU to the current lruclock (minutes resolution). */
+    o->lru = LRU_CLOCK();
+    return o;
+}
+```
+初始的lru是LRU_CLOCK
+```cpp
+#define LRU_CLOCK() ((1000/server.hz <= REDIS_LRU_CLOCK_RESOLUTION) ? server.lruclock : getLRUClock())
+```
+1000/server.hz 是server每秒被调用的次数  默认10次,最小1 最大500
+REDIS_LRU_CLOCK_RESOLUTION 是1000,    这里应该理解成**多少毫秒作为一个采样周期**.  
+server.lruclock后续被调整  
+
+如果当前1000/hz <= 1000,也就是当前系统没有被调用,使用getLRUClock;否则使用服务的lruclock.
+```cpp
+unsigned int getLRUClock(void) {
+    return (mstime()/REDIS_LRU_CLOCK_RESOLUTION) & REDIS_LRU_CLOCK_MAX;
+}
+```
+```cpp
+#define REDIS_LRU_CLOCK_MAX ((1<<REDIS_LRU_BITS)-1)
+```
+所以LRU的上限是2^24 - 1,getLRUClock拿到的就是秒数时间戳. 2^24 -1 大约是388天.所以一个LRU周期是388天  
+综上:如果服务器最近一秒被访问超过一次,也就是最近server的时钟是可信的,因为在最近的采样周期内server被访问过.1000表示的是1000个ms.这里的意思是当前的服务器采样周期是否比REDIS_LRU_CLOCK_RESOLUTION,也就是默认的采样周期要小.如果采样周期比默认的都小,说明这时候服务的采样是可信的,精度更高,直接使用server的lrulclock.否则计算一次,拿到一个秒级别的时间戳(需要&2<<24 -1)
+
+除非REDIS_LRU_CLOCK_RESOLUTION设置比较小,采样周期比较小,否则都会拿到server.lruclock  
+
+### 字符串类型
+REDIS_ENCODING_EMBSTR  
+使用连续的空间,redisObject,sds以及sds的buf空间连续.  
+当长度<=39 使用EMBSTR类型,否则使用RawStringObject(buf内存和sds不连续)  
+#### 39作为分水岭
+```cpp
+struct sdshdr {
+    
+    // buf 中已占用空间的长度 
+    int len;
+
+    // buf 中剩余可用空间的长度
+    int free;
+
+    // 数据空间
+    char buf[];
+};
+```
+```cpp
+typedef struct redisObject {
+
+    // 类型
+    unsigned type:4;
+
+    // 编码
+    unsigned encoding:4;
+
+    // 对象最后一次被访问的时间
+    unsigned lru:REDIS_LRU_BITS; /* lru time (relative to server.lruclock) */
+
+    // 引用计数
+    int refcount;
+
+    // 指向实际值的指针
+    void *ptr;
+
+} robj;
+```
+robj:8+8+8+4+8 =36
+sds:4+4+? = 8+?   
+还要再最后留一个字符给\0,39的意义是**刚好整块内存空间是64,满足jmalloc的一个小内存分配**,字符对齐且满足日常小字符串使用.  
+```cpp
+we allocate as EMBSTR will still fit into the 64 byte arena of jemalloc
+```
+
+#### robj *createStringObjectFromLongLong(long long value)
+传入的整数值保存为字符串对象  
+- 如果小于10000,会引用预先开辟好的共享内存空间(常用小数字,字符等),减少内存碎片
+- 如果value大小在0x7fffffffffffffffL内,直接转为void*,就是用ptr存放数据,编码类型REDIS_ENCODING_INT.  
+- 如果value大小超过0x7fffffffffffffffL,新建一个REDIS_STRING对象,里面的sds的buff放的是value转化为字符串之后的buffer.
+```cpp
+robj *createStringObjectFromLongLong(long long value) {
+
+    robj *o;
+
+    // value 的大小符合 REDIS 共享整数的范围
+    // 那么返回一个共享对象
+    if (value >= 0 && value < REDIS_SHARED_INTEGERS) {
+        incrRefCount(shared.integers[value]);
+        o = shared.integers[value];
+
+    // 不符合共享范围，创建一个新的整数对象
+    } else {
+        // 值可以用 long 类型保存，
+        // 创建一个 REDIS_ENCODING_INT 编码的字符串对象
+        if (value >= LONG_MIN && value <= LONG_MAX) {
+            o = createObject(REDIS_STRING, NULL);
+            o->encoding = REDIS_ENCODING_INT;
+            o->ptr = (void*)((long)value);
+
+        // 值不能用 long 类型保存（long long 类型），将值转换为字符串，
+        // 并创建一个 REDIS_ENCODING_RAW 的字符串对象来保存值
+        } else {
+            o = createObject(REDIS_STRING,sdsfromlonglong(value));
+        }
+    }
+
+    return o;
+}
+```
+
+#### robj *createStringObjectFromLongDouble(long double value) 
+使用17位小数,初始化之后对字符串最后的0删除.如果最后的是小数点,直接删除.  
+然后createStringObject
+
+#### robj *dupStringObject(robj *o) 
+新建一个对象,包括字符串内容.  
+根据对象的类型:REDIS_ENCODING_RAW,REDIS_ENCODING_EMBSTR,REDIS_ENCODING_INT分别对应复制.  
+新对象refcount=1,就是当做新对象对待.
+
+#### 新建对象类型
+
+|函数|对象类型|对象编码|
+|---|---|---|
+|createListObject|REDIS_LIST|REDIS_ENCODING_LINKEDLIST|
+|createZiplistObject|REDIS_LIST|REDIS_ENCODING_ZIPLIST|
+|createHashObject|REDIS_HASH|REDIS_ENCODING_ZIPLIST|
+|createZsetObject|REDIS_ZSET|REDIS_ENCODING_SKIPLIST|
+|createZsetZiplistObject|REDIS_ZSET|REDIS_ENCODING_ZIPLIST|
+
+#### 对象编码类型
+- list类
+    - REDIS_ENCODING_LINKEDLIST 释放需要挨个节点释放
+    - REDIS_ENCODING_ZIPLIST 直接zfree
+- set类
+    - REDIS_ENCODING_HT 需要挨个ht的table释放
+    - REDIS_ENCODING_INTSET  直接zfree
+- zset类
+    - REDIS_ENCODING_SKIPLIST  挨个跳表节点释放
+    - REDIS_ENCODING_ZIPLIST  直接释放
+- 哈希类
+    - REDIS_ENCODING_HT  挨个ht释放
+    - REDIS_ENCODING_ZIPLIST  zfree
+
+#### decrRefCount
+对象引用减少.减少到0时候释放内存.  
+类似inode  
+
+#### robj *tryObjectEncoding(robj *o)
+尝试对字符串对象进行编码,节约内存.  
+只在字符串的编码为 RAW 或者 EMBSTR 时尝试进行编码  
+REDIS_ENCODING_EMBSTR尝试转换为REDIS_ENCODING_INT  
+REDIS_ENCODING_RAW尝试转换为REDIS_ENCODING_EMBSTR,失败的话sdsRemoveFreeSpace(zrealloc)
+
+#### unsigned long long estimateObjectIdleTime(robj *o)
+```cpp
+unsigned long long estimateObjectIdleTime(robj *o) {
+    unsigned long long lruclock = LRU_CLOCK();
+    if (lruclock >= o->lru) {
+        return (lruclock - o->lru) * REDIS_LRU_CLOCK_RESOLUTION;
+    } else {
+        return (lruclock + (REDIS_LRU_CLOCK_MAX - o->lru)) *
+                    REDIS_LRU_CLOCK_RESOLUTION;
+    }
+}
+```
+LRU_CLOCK可以看成是秒(ts&2^24 - 1)  
+如果当前的时间戳比对象的lru大,直接返回毫秒格式的  
+如果当前对象的lru比当前的时间戳大,说明可能已经过了一个轮回,lru置0.所以实际的空转时间是max-o.lru+lurclock  
+```ditaa
+┌─────────────────────────────────────────────────────────────┐       
+│                            o.lru                            │       
+├─────────────────────────────────────────────────────────────┴──────┐
+│                              LRU_MAX                               │
+├───────────┬────────────────────────────────────────────────────────┘
+│LRU_CLOCK()│                                                         
+└───────────┘                                                         
+```
+
+### zset
+```cpp
+/*
+ * 有序集合
+ */
+typedef struct zset {
+
+    // 字典，键为成员，值为分值
+    // 用于支持 O(1) 复杂度的按成员取分值操作
+    dict *dict;
+
+    // 跳跃表，按分值排序成员
+    // 用于支持平均复杂度为 O(log N) 的按分值定位成员操作
+    // 以及范围操作
+    zskiplist *zsl;
+
+} zset;
+```
+
+zset中包括跳表和dict
+如果zset同时满足下面条件:  
+- 元素数量<128
+- 每个元素长度<64 b
+
+zset可以退化成ziplist.注意,**此时仅有ziplist,没有dict**  
+#### 编码转换
+```cpp
+        // 有序集合在 ziplist 中的排列：
+        //
+        // | member-1 | score-1 | member-2 | score-2 | ... |
+        //
+```
+ziplist->skiplist(+dict):每次取出member和score,zsInsert给skiplist,dictAdd给dict
+```cpp
+    if (zobj->encoding == REDIS_ENCODING_ZIPLIST) {
+        unsigned char *zl = zobj->ptr;
+        unsigned char *eptr, *sptr;
+        unsigned char *vstr;
+        unsigned int vlen;
+        long long vlong;
+
+        if (encoding != REDIS_ENCODING_SKIPLIST)
+            redisPanic("Unknown target encoding");
+
+        // 创建有序集合结构
+        zs = zmalloc(sizeof(*zs));
+        // 字典
+        zs->dict = dictCreate(&zsetDictType,NULL);
+        // 跳跃表
+        zs->zsl = zslCreate();
+
+        // 有序集合在 ziplist 中的排列：
+        //
+        // | member-1 | score-1 | member-2 | score-2 | ... |
+        //
+        // 指向 ziplist 中的首个节点（保存着元素成员）
+        eptr = ziplistIndex(zl,0);
+        redisAssertWithInfo(NULL,zobj,eptr != NULL);
+        // 指向 ziplist 中的第二个节点（保存着元素分值）
+        sptr = ziplistNext(zl,eptr);
+        redisAssertWithInfo(NULL,zobj,sptr != NULL);
+
+        // 遍历所有 ziplist 节点，并将元素的成员和分值添加到有序集合中
+        while (eptr != NULL) {
+            
+            // 取出分值
+            score = zzlGetScore(sptr);
+
+            // 取出成员
+            redisAssertWithInfo(NULL,zobj,ziplistGet(eptr,&vstr,&vlen,&vlong));
+            if (vstr == NULL)
+                ele = createStringObjectFromLongLong(vlong);
+            else
+                ele = createStringObject((char*)vstr,vlen);
+
+            /* Has incremented refcount since it was just created. */
+            // 将成员和分值分别关联到跳跃表和字典中
+            node = zslInsert(zs->zsl,score,ele);
+            redisAssertWithInfo(NULL,zobj,dictAdd(zs->dict,ele,&node->score) == DICT_OK);
+            incrRefCount(ele); /* Added to dictionary. */
+
+            // 移动指针，指向下个元素
+            zzlNext(zl,&eptr,&sptr);//每次eptr和sptr都跳两次
+        }
+
+        // 释放原来的 ziplist
+        zfree(zobj->ptr);
+
+        // 更新对象的值，以及编码方式
+        zobj->ptr = zs;
+        zobj->encoding = REDIS_ENCODING_SKIPLIST;
+
+    // 从 SKIPLIST 转换为 ZIPLIST 编码
+    } 
+```
+注意点:
+- ele对象是**新建**的,所以跳表和字典的ele是共享的,不会有重复的ele对象
+- ele需要新建是因为后续ziplist会释放掉,原来的数据都会gg
+- **字典的key是ele的指针,value就是score**
+- 跳表为了统计快,字典为了查找快
+
+
+skiplist->ziplist:释放dict,遍历skiplist,依次按照member,score写入到skiplist.  
+```cpp
+else if (zobj->encoding == REDIS_ENCODING_SKIPLIST) {
+
+        // 新的 ziplist
+        unsigned char *zl = ziplistNew();
+
+        if (encoding != REDIS_ENCODING_ZIPLIST)
+            redisPanic("Unknown target encoding");
+
+        /* Approach similar to zslFree(), since we want to free the skiplist at
+         * the same time as creating the ziplist. */
+        // 指向跳跃表
+        zs = zobj->ptr;
+
+        // 先释放字典，因为只需要跳跃表就可以遍历整个有序集合了
+        dictRelease(zs->dict);
+
+        // 指向跳跃表首个节点
+        node = zs->zsl->header->level[0].forward;
+
+        // 释放跳跃表表头
+        zfree(zs->zsl->header);
+        zfree(zs->zsl);
+
+        // 遍历跳跃表，取出里面的元素，并将它们添加到 ziplist
+        while (node) {
+
+            // 取出解码后的值对象
+            ele = getDecodedObject(node->obj);
+
+            // 添加元素到 ziplist
+            zl = zzlInsertAt(zl,NULL,ele,node->score);
+            decrRefCount(ele);
+
+            // 沿着跳跃表的第 0 层前进
+            next = node->level[0].forward;
+            zslFreeNode(node);
+            node = next;
+        }
+
+        // 释放跳跃表
+        zfree(zs);
+
+        // 更新对象的值，以及对象的编码方式
+        zobj->ptr = zl;
+        zobj->encoding = REDIS_ENCODING_ZIPLIST;
+    } 
+```
+注意:
+- 因为字典释放的时候根据(d)->type->valDestructor方法析构val(具体节点),是否val被释放要看zset创建
+- 根据顺序member score加入ziplist
+- 最后ele不是直接删除,而是decrRefCount.引用为0自动删除.防止其他对象有对ele引用报错
+
+#### createZsetObject
+创建skiplist的zset
+```cpp
+robj *createZsetObject(void) {
+
+    zset *zs = zmalloc(sizeof(*zs));
+
+    robj *o;
+
+    zs->dict = dictCreate(&zsetDictType,NULL);
+    zs->zsl = zslCreate();
+
+    o = createObject(REDIS_ZSET,zs);
+
+    o->encoding = REDIS_ENCODING_SKIPLIST;
+
+    return o;
+}
+```
+注意:object是REDIS_ZSET类型,编码是REDIS_ENCODING_SKIPLIST
+
+#### createZsetZiplistObject
+```cpp
+robj *createZsetZiplistObject(void) {
+
+    unsigned char *zl = ziplistNew();
+
+    robj *o = createObject(REDIS_ZSET,zl);
+
+    o->encoding = REDIS_ENCODING_ZIPLIST;
+
+    return o;
+}
+```
+注意:本质就是一个ziplist,只是对象的type是REDIS_ZSET
+
+## robj *lookupKey(redisDb *db, robj *key)
+redis在db中找key对应的指针   底层使用dict存储.
+```cpp
+robj *lookupKey(redisDb *db, robj *key) {
+
+    // 查找键空间
+    dictEntry *de = dictFind(db->dict,key->ptr);
+
+    // 节点存在
+    if (de) {
+        
+
+        // 取出值
+        robj *val = dictGetVal(de);
+
+        /* Update the access time for the ageing algorithm.
+         * Don't do it if we have a saving child, as this will trigger
+         * a copy on write madness. */
+        // 更新时间信息（只在不存在子进程时执行，防止破坏 copy-on-write 机制）
+        if (server.rdb_child_pid == -1 && server.aof_child_pid == -1)
+            val->lru = LRU_CLOCK();
+
+        // 返回值
+        return val;
+    } else {
+
+        // 节点不存在
+
+        return NULL;
+    }
+}
+```
+注意:只有在没有子进程的时候才会更新对象的lru.更新lru会改变内存,有子进程的时候会避免更改
+
+
+#### zaddGenericCommand
+如果server的dict(db的管理key模块,使用dict)没有key,新建:  
+- 如果配置server.zset_max_ziplist_entries是0,或者server.zset_max_ziplist_value(默认64)小于第一个key的长度,使用createZsetObject
+- 否则使用createZsetZiplistObject
+- 新建对象添加到c->db 使用dbAdd
+
+对象如果存在,检查type  
+- ziplist类型
+    - 如果之前没存在,添加
+    - 如果之前存在,score加上,然后删除,添加(更新流程)
+- skiplist类型
+    - 之前没存在,添加
+    - 之前存在,skiplist删除后重新添加(更新流程),dict直接对value更新
+
+最后清理临时变量
+
+# db
+db结构体
+```cpp
+typedef struct redisDb {
+
+    // 数据库键空间，保存着数据库中的所有键值对
+    dict *dict;                 /* The keyspace for this DB */
+
+    // 键的过期时间，字典的键为键，字典的值为过期事件 UNIX 时间戳
+    dict *expires;              /* Timeout of keys with a timeout set */
+
+    // 正处于阻塞状态的键
+    dict *blocking_keys;        /* Keys with clients waiting for data (BLPOP) */
+
+    // 可以解除阻塞的键
+    dict *ready_keys;           /* Blocked keys that received a PUSH */
+
+    // 正在被 WATCH 命令监视的键
+    dict *watched_keys;         /* WATCHED keys for MULTI/EXEC CAS */
+
+    struct evictionPoolEntry *eviction_pool;    /* Eviction pool of keys */
+
+    // 数据库号码
+    int id;                     /* Database ID */
+
+    // 数据库的键的平均 TTL ，统计信息
+    long long avg_ttl;          /* Average TTL, just for stats */
+
+} redisDb;
+```
+dcit:key是kv的key,v是对象指针  
+expires 记录key 的过期时间,value是unix时间戳  
+blocking_keys 记录阻塞状态的key  BLPOP使用
+ready_keys 记录可以解除阻塞的key PUSH使用
+watched_keys  记录正在waich的key,value是对应的client链表.  MULTI/EXEC使用  
+
+
+### robj *lookupKey(redisDb *db, robj *key)
+在db.dict中查找并返回.
+如果存在,当前有子进程,不更新lru(否则子进程需要重新拷贝一次内存,意义不大)
+
+### robj *lookupKeyRead(redisDb *db, robj *key)
+```cpp
+robj *lookupKeyRead(redisDb *db, robj *key) {
+    robj *val;
+
+    // 检查 key 释放已经过期
+    expireIfNeeded(db,key);
+
+    // 从数据库中取出键的值
+    val = lookupKey(db,key);
+
+    // 更新命中/不命中信息
+    if (val == NULL)
+        server.stat_keyspace_misses++;
+    else
+        server.stat_keyspace_hits++;
+
+    // 返回值
+    return val;
+}
+```
+先看是否过期,如果过期,根据情况会释放掉过期的数据.  
+然后从dict中找value的指针.根据找到的情况更新命中/不命中信息.  
+这里server是全局信息.  
+
+
+### int expireIfNeeded(redisDb *db, robj *key) 
+看是否过期,如果key过期会删掉.
+```cpp
+int expireIfNeeded(redisDb *db, robj *key) {
+
+    // 取出键的过期时间
+    mstime_t when = getExpire(db,key);
+    mstime_t now;
+
+    // 没有过期时间
+    if (when < 0) return 0; /* No expire for this key */
+
+    /* Don't expire anything while loading. It will be done later. */
+    // 如果服务器正在进行载入，那么不进行任何过期检查
+    if (server.loading) return 0;
+
+    /* If we are in the context of a Lua script, we claim that time is
+     * blocked to when the Lua script started. This way a key can expire
+     * only the first time it is accessed and not in the middle of the
+     * script execution, making propagation to slaves / AOF consistent.
+     * See issue #1525 on Github for more information. */
+    now = server.lua_caller ? server.lua_time_start : mstime();
+
+    /* If we are running in the context of a slave, return ASAP:
+     * the slave key expiration is controlled by the master that will
+     * send us synthesized DEL operations for expired keys.
+     *
+     * Still we try to return the right information to the caller, 
+     * that is, 0 if we think the key should be still valid, 1 if
+     * we think the key is expired at this time. */
+    // 当服务器运行在 replication 模式时
+    // 附属节点并不主动删除 key
+    // 它只返回一个逻辑上正确的返回值
+    // 真正的删除操作要等待主节点发来删除命令时才执行
+    // 从而保证数据的同步
+
+    if (server.masterhost != NULL) return now > when;
+
+    // 运行到这里，表示键带有过期时间，并且服务器为主节点
+
+    /* Return when this key has not expired */
+    // 如果未过期，返回 0
+    if (now <= when) return 0;
+
+    /* Delete the key */ 
+
+    //能到这里的逻辑已经是master
+    server.stat_expiredkeys++;
+
+    // 向 AOF 文件和附属节点传播过期信息
+ 
+    propagateExpire(db,key);
+
+    // 发送事件通知
+    notifyKeyspaceEvent(REDIS_NOTIFY_EXPIRED,
+        "expired",key,db->id);
+
+    // 将过期键从数据库中删除
+    return dbDelete(db,key);
+}
+```
+when:当前key的过期时间,如果-1,没有设置    
+now:当前时间  
+如果是slave,只返回结果,不删除.因为删除流程从master发起  
+如果正常没过期,返回0  
+主机删除需要的动作:
+- server过期key个数++
+- AOF文件写入删除信息
+- 发送事件给client:已经过期
+- 从db.dict删除key
+
+### robj *lookupKeyWrite(redisDb *db, robj *key)
+expireIfNeeded + lookupKey  
+不会统计命中信息
+
+### robj *lookupKeyReadOrReply(redisClient *c, robj *key, robj *reply)
+lookupKeyRead  
+如果不存在,addReply给客户端发送reply信息 与客户端交互使用
+
+### robj *lookupKeyWriteOrReply(redisClient *c, robj *key, robj *reply)
+lookupKeyWrite
+如果不存在,addReply给客户端发送reply信息 与客户端交互使用
+
+### void dbAdd(redisDb *db, robj *key, robj *val)
+dictAdd  
+如果开启了集群模式,slotToKeyAdd  
+
+### void slotToKeyAdd(robj *key)
+计算key的hash值,(使用低key crc16后&0x3FFF),往server.cluster->slots_to_keys这个跳表写入,score是key的hash,value是key  
+使用跳表的好处是:跳表的score是根据key计算的,所以根据score已经区分了位置,所以想知道这个key是否在某个slot中比较方便.(key是根据字典序在跳表中排列)  
+最后添加对key的引用
+```cpp
+void slotToKeyAdd(robj *key) {
+
+    // 计算出键所属的槽
+    unsigned int hashslot = keyHashSlot(key->ptr,sdslen(key->ptr));
+
+    // 将槽 slot 作为分值，键作为成员，添加到 slots_to_keys 跳跃表里面
+    zslInsert(server.cluster->slots_to_keys,hashslot,key);
+    incrRefCount(key);
+}
+```
+
+### void dbOverwrite(redisDb *db, robj *key, robj *val) 
+目的是把key的value更改,也就是把key对应的对象进行更改.
+db.dict找key  
+如果不存在,gg  
+存在,dictReplace
+
+
+### void setKey(redisDb *db, robj *key, robj *val)
+是一种不会过期的set key.不存在就加上,存在的话就直接更改.  
+需要告知watch的client有更改.使用signalModifiedKey,实际上调用的就是touchWatchedKey
+```cpp
+    // 添加或覆写数据库中的键值对
+    if (lookupKeyWrite(db,key) == NULL) {
+        dbAdd(db,key,val);
+    } else {
+        dbOverwrite(db,key,val);
+    }
+
+    incrRefCount(val);
+
+    // 移除键的过期时间
+    removeExpire(db,key);
+
+    // 发送键修改通知
+    signalModifiedKey(db,key);
+```
+
+### void touchWatchedKey(redisDb *db, robj *key)
+如果某个键被客户端监视,这些cli执行exec时事务失败.  
+获取db->watched_keys,本质上是一个dict,key是kv的key,value是client列表.根据key是否在被watch添加到这个字典中.  
+如果key在db->watched_keys中存在,clients中的所有flags都打上REDIS_DIRTY_CAS,表示watch的时候已经被修改.后续exec的时候会失败.  
+
+### int dbDelete(redisDb *db, robj *key)
+dictDelete(db->expires,key->ptr)  
+dictDelete(db->dict,key->ptr)  
+如果是集群模式slotToKeyDel(key)  
+不存在返回0,存在正常删除返回1  
+
+### void slotToKeyDel(robj *key)
+zslDelete(server.cluster->slots_to_keys,hashslot,key)  
+把当前的db中slots_to_keys对应的hashslot的key删除.
+
+### void slotToKeyFlush(void)
+清空节点中所有槽保存的所有键  
+先对server.cluster->slots_to_keys进行zslFree  
+再进行zslCreate()  
+
+### unsigned int getKeysInSlot(unsigned int hashslot, robj **keys, unsigned int count) 
+记录入参是hashslot,以及count表示数组大小. 
+回参keys,robj数组,表示属于hashslot中count个的robj 
+把这些数组都放进去hashslot中,并且返回加入之后这个slot的key个数.
+
+### unsigned int delKeysInSlot(unsigned int hashslot) 
+删除hashslot的key,返回删除的个数
+
+### unsigned int countKeysInSlot(unsigned int hashslot)
+计算hashslot的key个数.  
+使用rank头尾相减得到
+
+### long long emptyDb(void(callback)(void*))
+清空db所有数据  
+对每个db[]下的dict以及expires进行清空(dictEmpty)  
+如果server.cluster_enabled,slotToKeyFlush  
+返回删除key个数
+
+### int selectDb(redisClient *c, int id)
+c.db=server.db[id]
+
+### void signalFlushedDb(int dbid)
+db清空的时候会触发,调用touchWatchedKeysOnFlush
+
+### void touchWatchedKeysOnFlush(int dbid)
+当某个db清空的时候,如果cli的watch key的db是传入的dbid,需要打标REDIS_DIRTY_CAS  
+server的cli是链表形式存放,client的watch_keys也使用链表形式存放
+
+### void flushdbCommand(redisClient *c)
+清空客户端所有的数据库  
+signalFlushedDb(c->db->id),对这个db的所有关联cli发通知  
+清空cli.db.dict cli.d..expires  
+如果开启集群模式slotToKeyFlush  
+给cli返回成功信息
+
+### void flushallCommand(redisClient *c) 
+清空server所有db  
+signalFlushedDb(-1)   
+如果有正在保存的新的rdb,取消保存操作(kill进程,unlink文件)  
+如果当前server还有saving points,rdbSave之后把原来的server.dirty属性在执行rdbSave后恢复到server(因为rdbSave的时候会调整dirty属性)
+
+
+### void delCommand(redisClient *c)
+c会有需要删除的键  使用命令DEL k1 k2 ...  
+先删除过期的key  
+然后dbDelete(c->db,c->argv[j]),成功的话db->watched_keys写入dirty(其他watch这个key的client会感知)  
+notifyKeyspaceEvent,把删除事件通知到对应的db  
+
+### void notifyKeyspaceEvent(int type, char *event, robj *key, int dbid) 
+- event:c字符串,表示事件名称
+- key:事件相关的key
+- dbid:key所在的dbid
+- type:发送通知类型
+
+如果配置server.notify_keyspace_events不发送对应的type,直接返回  
+如果配置了发送REDIS_NOTIFY_KEYSPACE  
+chan格式: __keyspace@<db>__:<key>  发送<event>
+
+如果配置了发送REDIS_NOTIFY_KEYEVENT
+chan格式:__keyevente@<db>__:<event> 发送<key>
+
+使用pubsubPublishMessage发送消息
+
+### int pubsubPublishMessage(robj *channel, robj *message)
+如果channel在server的订阅频道中存在(使用dict存储),这个channel下挂的cli链表发送消息  
+如果server有pubsub_patterns(客户端订阅的所有模式的名字,list,内容是cli和模式结构体),如果模式匹配(正则表达式),给对应的cli发送消息
+
+
+```cpp
+
+  int pubsubPublishMessage(robj *channel, robj *message) {
+      int receivers = 0;
+      dictEntry *de;
+      listNode *ln;
+      listIter li;
+
+      /* Send to clients listening for that channel */
+      // 取出包含所有订阅频道 channel 的客户端的链表
+      // 并将消息发送给它们
+      de = dictFind(server.pubsub_channels,channel);
+      if (de) {
+          list *list = dictGetVal(de);
+          listNode *ln;
+          listIter li;
+
+          // 遍历客户端链表，将 message 发送给它们
+          listRewind(list,&li);
+          while ((ln = listNext(&li)) != NULL) {
+              redisClient *c = ln->value;
+
+              // 回复客户端。
+              // 示例：
+              // 1) "message"
+              // 2) "xxx"
+              // 3) "hello"
+              addReply(c,shared.mbulkhdr[3]);
+              // "message" 字符串
+              addReply(c,shared.messagebulk);
+              // 消息的来源频道
+              addReplyBulk(c,channel);
+              // 消息内容
+              addReplyBulk(c,message);
+
+              // 接收客户端计数
+              receivers++;
+          }
+      }
+
+      /* Send to clients listening to matching channels */
+      // 将消息也发送给那些和频道匹配的模式
+      if (listLength(server.pubsub_patterns)) {
+
+          // 遍历模式链表
+          listRewind(server.pubsub_patterns,&li);
+          channel = getDecodedObject(channel);
+          while ((ln = listNext(&li)) != NULL) {
+
+              // 取出 pubsubPattern
+              pubsubPattern *pat = ln->value;
+
+              // 如果 channel 和 pattern 匹配
+              // 就给所有订阅该 pattern 的客户端发送消息
+              if (stringmatchlen((char*)pat->pattern->ptr,
+                                  sdslen(pat->pattern->ptr),
+                                  (char*)channel->ptr,
+                                  sdslen(channel->ptr),0)) {
+
+                  // 回复客户端
+                  // 示例：
+                  // 1) "pmessage"
+                  // 2) "*"
+                  // 3) "xxx"
+                  // 4) "hello"
+                  addReply(pat->client,shared.mbulkhdr[4]);
+                  addReply(pat->client,shared.pmessagebulk);
+                  addReplyBulk(pat->client,pat->pattern);
+                  addReplyBulk(pat->client,channel);
+                  addReplyBulk(pat->client,message);
+
+                  // 对接收消息的客户端进行计数
+                  receivers++;
+              }
+          }
+
+          decrRefCount(channel);
+      }
+
+      // 返回计数
+      return receivers;
+  }
+```
+
+### void existsCommand(redisClient *c)
+先检查key是否过期  
+给c返回是否存在
+
+### void selectCommand(redisClient *c)
+这里的select是切换db,换到对应dbid
+1.看c的dbid是否合法,不合法gg  
+2.看当前是否集群模式,如果是,不允许select  
+3.切换db,失败gg  
+4.给c返回  
+
+### void keysCommand(redisClient *c)
+返回keys,对c->db->dict遍历,addReplyBulk返回给c
+
+### void scanGenericCommand(redisClient *c, robj *o, unsigned long cursor)
+SCAN,HSCAN,SSCAN实现函数  
+解析命令,根据对象encoding进行扫描,dict使用dictscan,跳表使用ite  
+整合数据后返回
+
+### void renameGenericCommand(redisClient *c, int nx)
+更改key名字.RENAME a b
+- 名字一样,报错
+- 取出a,如果不存在,gg
+- 查看b的key是否存在,存在分情况,RENAMENX直接返回,RENAME就删除b
+- 把a在dict中的o给b
+
+### void moveCommand(redisClient *c) 
+从c.db移动到c->argv[2]指定的db 类似rename,只是在不同的dbidx中转移
+
+### void propagateExpire(redisDb *db, robj *key)
+将某个key的过期事件传播给AOF文件以及附属节点  
+如果server.aof_state != REDIS_AOF_OFF,AOF中添加上删除key命令  
+使用replicationFeedSlaves对各个server.slaves传播删除key命令
+
+### void expireGenericCommand(redisClient *c, long long basetime, int unit)  
+过期,主机且不在loading状态:notifyKeyspaceEvent 删除
+其他:可能过期,notifyKeyspaceEvent expire
+
+## redisDb
+```cpp
+typedef struct redisDb {
+
+    // 数据库键空间，保存着数据库中的所有键值对
+    dict *dict;                 /* The keyspace for this DB */
+
+    // 键的过期时间，字典的键为键，字典的值为过期事件 UNIX 时间戳
+    dict *expires;              /* Timeout of keys with a timeout set */
+
+    // 正处于阻塞状态的键
+    dict *blocking_keys;        /* Keys with clients waiting for data (BLPOP) */
+
+    // 可以解除阻塞的键
+    dict *ready_keys;           /* Blocked keys that received a PUSH */
+
+    // 正在被 WATCH 命令监视的键
+    dict *watched_keys;         /* WATCHED keys for MULTI/EXEC CAS */
+
+    struct evictionPoolEntry *eviction_pool;    /* Eviction pool of keys */
+
+    // 数据库号码
+    int id;                     /* Database ID */
+
+    // 数据库的键的平均 TTL ，统计信息
+    long long avg_ttl;          /* Average TTL, just for stats */
+
+} redisDb;
+```
+
+### void activeExpireCycle(int type) 
+定期删除  
+```cpp
+void activeExpireCycle(int type) {
+    /* This function has some global state in order to continue the work
+     * incrementally across calls. */
+    // 静态变量，用来累积函数连续执行时的数据
+    static unsigned int current_db = 0; /* Last DB tested. */
+    static int timelimit_exit = 0;      /* Time limit hit in previous call? */
+    static long long last_fast_cycle = 0; /* When last fast cycle ran. */
+
+    unsigned int j, iteration = 0;
+    // 默认每次处理的数据库数量
+    unsigned int dbs_per_call = REDIS_DBCRON_DBS_PER_CALL;
+    // 函数开始的时间
+    long long start = ustime(), timelimit;
+
+    // 快速模式
+    if (type == ACTIVE_EXPIRE_CYCLE_FAST) {
+        /* Don't start a fast cycle if the previous cycle did not exited
+         * for time limt. Also don't repeat a fast cycle for the same period
+         * as the fast cycle total duration itself. */
+        // 如果上次函数没有触发 timelimit_exit ，那么不执行处理
+        if (!timelimit_exit) return;
+        // 如果距离上次执行未够一定时间，那么不执行处理
+        if (start < last_fast_cycle + ACTIVE_EXPIRE_CYCLE_FAST_DURATION*2) return;
+        // 运行到这里，说明执行快速处理，记录当前时间
+        last_fast_cycle = start;
+    }
+
+    /* We usually should test REDIS_DBCRON_DBS_PER_CALL per iteration, with
+     * two exceptions:
+     *
+     * 一般情况下，函数只处理 REDIS_DBCRON_DBS_PER_CALL 个数据库，
+     * 除非：
+     *
+     * 1) Don't test more DBs than we have.
+     *    当前数据库的数量小于 REDIS_DBCRON_DBS_PER_CALL
+     * 2) If last time we hit the time limit, we want to scan all DBs
+     * in this iteration, as there is work to do in some DB and we don't want
+     * expired keys to use memory for too much time. 
+     *     如果上次处理遇到了时间上限，那么这次需要对所有数据库进行扫描，
+     *     这可以避免过多的过期键占用空间
+     */
+    if (dbs_per_call > server.dbnum || timelimit_exit)
+        dbs_per_call = server.dbnum;
+
+    /* We can use at max ACTIVE_EXPIRE_CYCLE_SLOW_TIME_PERC percentage of CPU time
+     * per iteration. Since this function gets called with a frequency of
+     * server.hz times per second, the following is the max amount of
+     * microseconds we can spend in this function. */
+    // 函数处理的微秒时间上限
+    // ACTIVE_EXPIRE_CYCLE_SLOW_TIME_PERC 默认为 25 ，也即是 25 % 的 CPU 时间
+    timelimit = 1000000*ACTIVE_EXPIRE_CYCLE_SLOW_TIME_PERC/server.hz/100;
+    //hz是每秒的次数.1000000/hz就是看us/time,表示这次处理的时候最多是多少个微秒.  
+    timelimit_exit = 0;
+    if (timelimit <= 0) timelimit = 1;
+
+    // 如果是运行在快速模式之下
+    // 那么最多只能运行 FAST_DURATION 微秒 
+    // 默认值为 1000 （微秒）
+    if (type == ACTIVE_EXPIRE_CYCLE_FAST)
+        timelimit = ACTIVE_EXPIRE_CYCLE_FAST_DURATION; /* in microseconds. */
+
+    // 遍历数据库
+    for (j = 0; j < dbs_per_call; j++) {
+        int expired;
+        // 指向要处理的数据库
+        redisDb *db = server.db+(current_db % server.dbnum);
+
+        /* Increment the DB now so we are sure if we run out of time
+         * in the current DB we'll restart from the next. This allows to
+         * distribute the time evenly across DBs. */
+        // 为 DB 计数器加一，如果进入 do 循环之后因为超时而跳出
+        // 那么下次会直接从下个 DB 开始处理
+        current_db++;
+
+        /* Continue to expire if at the end of the cycle more than 25%
+         * of the keys were expired. */
+        do {
+            unsigned long num, slots;
+            long long now, ttl_sum;
+            int ttl_samples;
+
+            /* If there is nothing to expire try next DB ASAP. */
+            // 获取数据库中带过期时间的键的数量
+            // 如果该数量为 0 ，直接跳过这个数据库
+            if ((num = dictSize(db->expires)) == 0) {
+                db->avg_ttl = 0;
+                break;
+            }
+            // 获取数据库中键值对的数量
+            slots = dictSlots(db->expires);
+            // 当前时间
+            now = mstime();
+
+            /* When there are less than 1% filled slots getting random
+             * keys is expensive, so stop here waiting for better times...
+             * The dictionary will be resized asap. */
+            // 这个数据库的使用率低于 1% ，扫描起来太费力了（大部分都会 MISS）
+            // 跳过，等待字典收缩程序运行
+            if (num && slots > DICT_HT_INITIAL_SIZE &&
+                (num*100/slots < 1)) break;
+
+            /* The main collection cycle. Sample random keys among keys
+             * with an expire set, checking for expired ones. 
+             *
+             * 样本计数器
+             */
+            // 已处理过期键计数器
+            expired = 0;
+            // 键的总 TTL 计数器
+            ttl_sum = 0;
+            // 总共处理的键计数器
+            ttl_samples = 0;
+
+            // 每次最多只能检查 LOOKUPS_PER_LOOP 个键
+            if (num > ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP)
+                num = ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP;
+
+            // 开始遍历数据库
+            while (num--) {
+                dictEntry *de;
+                long long ttl;
+
+                // 从 expires 中随机取出一个带过期时间的键
+                if ((de = dictGetRandomKey(db->expires)) == NULL) break;
+                // 计算 TTL
+                ttl = dictGetSignedIntegerVal(de)-now;
+                // 如果键已经过期，那么删除它，并将 expired 计数器增一
+                if (activeExpireCycleTryExpire(db,de,now)) expired++;
+                if (ttl < 0) ttl = 0;
+                // 累积键的 TTL
+                ttl_sum += ttl;
+                // 累积处理键的个数
+                ttl_samples++;
+            }
+
+            /* Update the average TTL stats for this database. */
+            // 为这个数据库更新平均 TTL 统计数据
+            if (ttl_samples) {
+                // 计算当前平均值
+                long long avg_ttl = ttl_sum/ttl_samples;
+                
+                // 如果这是第一次设置数据库平均 TTL ，那么进行初始化
+                if (db->avg_ttl == 0) db->avg_ttl = avg_ttl;
+                /* Smooth the value averaging with the previous one. */
+                // 取数据库的上次平均 TTL 和今次平均 TTL 的平均值
+                db->avg_ttl = (db->avg_ttl+avg_ttl)/2;
+            }
+
+            /* We can't block forever here even if there are many keys to
+             * expire. So after a given amount of milliseconds return to the
+             * caller waiting for the other active expire cycle. */
+            // 我们不能用太长时间处理过期键，
+            // 所以这个函数执行一定时间之后就要返回
+
+            // 更新遍历次数
+            iteration++;
+
+            // 每遍历 16 次执行一次
+            if ((iteration & 0xf) == 0 && /* check once every 16 iterations. */
+                (ustime()-start) > timelimit)
+            {
+                // 如果遍历次数正好是 16 的倍数
+                // 并且遍历的时间超过了 timelimit
+                // 那么断开 timelimit_exit
+                timelimit_exit = 1;
+            }
+
+            // 已经超时了，返回
+            if (timelimit_exit) return;
+
+            /* We don't repeat the cycle if there are less than 25% of keys
+             * found expired in the current DB. */
+            // 如果已删除的过期键占当前总数据库带过期时间的键数量的 25 %
+            // 那么不再遍历
+        } while (expired > ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP/4);
+    }
+}
+```
+
+注意:  
+如果过期超过5个,继续循环.因为最后一次可能会少于5个,就是没有expire可以删  
+如果扫了16次还没有超过时间限制,继续扫.需要**超过时间限制并且扫了16的倍数**才完成  
+hz是每秒的次数.1000000/hz就是看us/time,表示这次处理的时候最多是多少个微秒.  
 
 
 
