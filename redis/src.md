@@ -2303,5 +2303,34 @@ void activeExpireCycle(int type) {
 hz是每秒的次数.1000000/hz就是看us/time,表示这次处理的时候最多是多少个微秒.  
 
 
-## 集群等
+## 总体
 ![](../imgs/redis/redis.png)
+
+### rdb
+周期性写  
+如果可以写给slave,每次写入16K,写入后更新slave.repldboff,下次根据这个offset继续发  
+如果整个rdb发送,从机每次最多读8M,写入文件.防止刷爆磁盘  
+
+**不允许rehash**   
+如果发完,就是repldboff>repldbsize,表示更新完成.
+- repldbfd,置-1.清空相关参数,等待下次继续.
+- 添加fd事件sendReplyToClient,之前没有回复slave的一起回复  
+
+子线程会关闭网络,遍历db.dict,进行写入rdb操作
+
+
+### aof
+重写aof  
+不管新版老版都是直接遍历所有dict  根据类型重写 
+**不允许rehash**  
+
+### 复制机制
+如果和主机连接超时,断开连接,删除临时文件  
+从机主动向主机发出psync  请求同步
+
+### 删除策略
+处理了command之后,如果配置了server. maxmemory  
+REDIS_MAXMEMORY_ALLKEYS_LRU  REDIS_MAXMEMORY_ALLKEYS_RANDOM 直接从dict中删,db选取方法0开始找size>0的  
+其他的从expire中找删,db选取方法一样  
+LRU方法:通过对象中的lru(最后一次访问时间)和当前server.lru进行对比,每次随机获取若干个,在那里面淘汰最老的  
+TTL方法:看key的过期时间,类似LRU,但是LRU是看对象的lru,TTL是看expire中key的过期时间  
