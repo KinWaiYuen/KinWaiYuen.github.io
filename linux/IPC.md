@@ -1640,6 +1640,7 @@ int main(int argc, char* argv[])
 }
 ```
 
+输出
 ```
 ➜  mmap ./mmap tt
 [1]    29909 bus error (core dumped)  ./mmap tt
@@ -1656,9 +1657,18 @@ Program received signal SIGBUS, Bus error.
 Missing separate debuginfos, use: debuginfo-install glibc-2.17-260.el7_6.3.x86_64
 (gdb)
 ```
+
+**SIGBUS的原因**
+```
+The mmap() function can be used to map a region of memory that is larger than the current size of the object. Memory access within the mapping but beyond the current end of the underlying objects may result in SIGBUS signals being sent to the process. The reason for this is that the size of the object can be manipulated by other processes and can change at any moment. The implementation should tell the application that a memory reference is outside the object where this can be detected; otherwise, written data may be lost and read data may not reflect actual data in the object.
+```
+也就是后面的内存区域因为可能访问到了别的进程使用的内存空间,所以使用SIGBUS返回告警用户    
+
+
 可以看到是在写入内存的时候core的.
 
 如果超过了内存映射也最后一页写,会SIGSEV
+
 ```ditaa
      ┌──────────────────────────────────────────────────┬───────────────────┐
      │                 memory end page                  │ memory next page  │
