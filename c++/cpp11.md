@@ -680,4 +680,151 @@ sh: pause: command not found
 **弱引用当引用的对象活着的时候不一定存在。仅仅是当它自身存在的时的一个引用.弱引用并不修改该对象的引用计数，这意味这弱引用它并不对对象的内存进行管理**
 
 
+### std::unique_ptr
+只能独占对象资源,不能共享.如果需要其他指针指向,需要使用std::move  
+不能使用copy构造函数或者赋值操作   
+```cpp
 
+int main() 
+{
+    // 创建一个unique_ptr实例
+    unique_ptr<int> pInt(new int(5));
+    unique_ptr<int> pInt2(pInt);    // 报错
+    unique_ptr<int> pInt3 = pInt;   // 报错
+}
+```
+
+在函数中返回unique_ptr可以支持拷贝操作  
+```cpp
+#include <iostream>
+#include <memory>
+#include <stdlib.h>
+
+using namespace std;
+unique_ptr<int> clone(int p)
+{
+    unique_ptr<int> pInt(new int(p));
+    return pInt;    // 返回unique_ptr
+}
+
+int main() {
+    int p = 5;
+    unique_ptr<int> ret = clone(p);
+    cout << *ret << endl;
+}
+```
+
+#### 为什么使用
+能确保没有使用的时候自动析构
+```cpp
+#include <iostream>
+#include <memory>
+#include <stdlib.h>
+
+using namespace std;
+unique_ptr<int> clone(int p)
+{
+    unique_ptr<int> pInt(new int(p));
+    return pInt;    // 返回unique_ptr
+}
+
+class A{
+
+public: int a;
+        A(int aa){
+            this->a = aa;
+        };
+        ~A(){
+            std::cout << "object deleted. a=" << this->a << std::endl;
+        };
+};
+
+
+int main() {
+    int p = 5;
+    unique_ptr<int> ret = clone(p);
+    cout << *ret << endl;
+    {
+        unique_ptr<A> pA(new A(10));
+    }
+    std::cout << "before main return 0"<< std::endl;
+    return 0;
+}
+```
+
+输出
+```
+5
+object deleted. a=10
+before main return 0
+```
+
+能看到在花括号已经被析构  
+
+如果unique指向的对象实例有多个unique_ptr,编译报错  
+
+
+
+### auto & decltype
+#### auto
+因为在c++编程中,尤其对模板编程,变量类型不关心但是需要继续逻辑编辑.  
+通过在编译过程推算类型确定auto的变量最终变量类型  
+auto会忽略**顶层const**  
+- 顶层const
+    - `int *const p = &i`,这个p不会改变,就是**p指向的内存地址不变**.但是**内存地址指向的内容**可以改变.这时候i=9,是ok的
+- 底层const
+    - `const int *p = &i`,这里的const限制的是p的内容.p是一个指针,但是指向的**内容以及类型**不允许更改,但是指针自己是**可以改变**
+
+一个声明变量语句只能有一个基本数据类型,所以语句的所有变量初始基本数据类型必须一致.  
+```cpp
+
+auto sz = 0, pi = 3.14;//错误,两个变量的类型不一样。
+```
+
+|i\p|可变|不可变|
+|---|---|---|
+|可变|无const|顶层const|
+|不可变|底层const|顶层和底层const|
+
+
+```cpp
+#include<iostream>
+using namespace std;
+int main()
+{
+    const int i = 1;
+    const int *p1 = &i;        //这里p是指向整型常量的指针:*p是不可变的,但P本身是可变的>>>这是底层const
+    *p1 = 2;            //错误
+    int k = 2;
+    p1 = &k;            //正确
+    
+/*-----------------------------分割线1----------------------------------*/
+
+    int j = 1;
+    int *const p2 = &j;        //这里p2是指向整型的常量指针:*p是可变的,但p本身不可变>>>>>>这是顶层const
+    *p2 = 4;            //正确
+    p2 = &i;            //错误
+
+/*-----------------------------分割线2------------------------------- --*/
+
+    const int *const p3 = &i;//这里p3是指向整型常量的常量指针:*p和p本身都不可变>>>p3即使顶层const也是底层const
+    int *r = p2;        //正确,p2的顶层const可以忽略
+    int *r1 = p1;        //错误,p1有底层const属性
+
+/*-----------------------------分割线3------------------------------- --*/
+    auto *r2 = p2;        //r2会被认为是int*型
+    auto *r3 = p1;        //r3--------是const int
+    auto *r4 = p3;        //r4--------是const int(顶层const被忽略了)
+    
+/*-----------------------------分割线4------------------------------- --*/    
+            
+    //情况1，i(不可变)是有顶层的const,会被auto忽略,f会被认为是int.加左边的const后f变成顶层const
+    const auto f = i;
+    auto *const r5 = p3;        //情况2，保存指针的顶层const
+    return 0;
+}
+```
+
+#### decltype
+希望从表达式中推断定义变量的类型,但是不想用表达式的值初始化变量.还有可能是函数返回类型是某表达式的值得类型.  
+decltype会保留const,不管顶层还是底层  
