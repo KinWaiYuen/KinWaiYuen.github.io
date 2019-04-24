@@ -48,11 +48,11 @@ exec函数族
 - int execvp(const char* file, char* const argv[]);
 - int execve(const char* path, char* const argv[], char* const envp[]);
 
-l list 命令行参数列表
-p path 搜索file时候使用path环境变量
-v vector 使用命令行参数数组
-e environment 使用环境变量数组
-execve才是系统调用,其他都是封装
+l list 命令行参数列表  
+p path 搜索file时候使用path环境变量  
+v vector 使用命令行参数数组  
+e environment 使用环境变量数组  
+execve才是系统调用,其他都是封装  
 
 注意点:
 - arg参数是从argv[0]开始,所以这里的argv写的时候,例如调用ps 就先写ps;调用哪个二进制的话也要把路径写上

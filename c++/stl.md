@@ -25,6 +25,7 @@ for(ite=map.begin();ite!=map.end();){
         ite++;
     }
 }
+注意:这里原来的ite会不存在的.使用ite++成功是因为ite++的时候,其实有一个过程是生成了临时变量,返回的是临时变量.执行`map.erase(ite++)`的时候,erase的是ite,但是ite最后是被临时变量ite
 ```
 
 ### 链式容器
@@ -40,3 +41,4 @@ for(ite=list.begin();ite!=end();){
     }
 }
 ```
+注意:和上面原理一样,其实ite已经不存在
